@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Optional
 import pdfplumber
 from dateutil import parser as dateutil_parser
+from pdfminer.pdfdocument import PDFPasswordIncorrect
 
 logger = logging.getLogger(__name__)
 
@@ -35,12 +36,12 @@ def _parse_date(raw: str) -> Optional[str]:
         return None
 
 
-def _extract_tables(pdf_path: str, account_name: str) -> dict:
+def _extract_tables(pdf_path: str, account_name: str, password: str = "") -> tuple:
     transactions = []
     metadata = {}
     pages_with_tables = 0
 
-    with pdfplumber.open(pdf_path) as pdf:
+    with pdfplumber.open(pdf_path, password=password) as pdf:
         for page_num, page in enumerate(pdf.pages):
             tables = page.extract_tables()
             if not tables:
@@ -135,11 +136,11 @@ def _extract_metadata_from_text(text: str) -> dict:
     return meta
 
 
-def extract_with_pdfplumber(pdf_path: str, account_name: str) -> dict:
+def extract_with_pdfplumber(pdf_path: str, account_name: str, password: str = "") -> dict:
     try:
-        transactions, metadata, pages_with_tables = _extract_tables(pdf_path, account_name)
+        transactions, metadata, pages_with_tables = _extract_tables(pdf_path, account_name, password)
 
-        with pdfplumber.open(pdf_path) as pdf:
+        with pdfplumber.open(pdf_path, password=password) as pdf:
             full_text = "\n".join(
                 page.extract_text() or "" for page in pdf.pages
             )
@@ -152,7 +153,6 @@ def extract_with_pdfplumber(pdf_path: str, account_name: str) -> dict:
         elif pages_with_tables == 0:
             confidence = 0.3
         else:
-            # Higher confidence when dates and amounts were clearly parsed
             valid = sum(
                 1 for t in transactions
                 if t.get("date") and t.get("amount") and t.get("description")
@@ -165,6 +165,12 @@ def extract_with_pdfplumber(pdf_path: str, account_name: str) -> dict:
             "confidence": confidence,
             "method": "pdfplumber",
         }
+
+    except PDFPasswordIncorrect:
+        # Distinguish "no password tried" from "wrong password tried" so callers can show the right message
+        error = "password_incorrect" if password else "password_required"
+        logger.warning("PDF password error (%s) for %s", error, account_name)
+        return {"transactions": [], "metadata": {}, "confidence": 0.0, "method": "pdfplumber", "error": error}
 
     except Exception as exc:
         logger.exception("pdfplumber extraction failed: %s", exc)

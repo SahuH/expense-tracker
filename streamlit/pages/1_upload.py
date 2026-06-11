@@ -3,9 +3,12 @@ import requests
 import pandas as pd
 import io
 import os
+from urllib.parse import quote
 
 from auth import require_login
 from firefly_api import get_accounts
+
+st.set_page_config(page_title="Upload & Import — Household Finance", page_icon="💰", layout="wide")
 
 _, _, authentication_status = require_login()
 if not authentication_status:
@@ -31,6 +34,47 @@ except Exception as exc:
     }
 
 selected_account = st.selectbox("Account", list(account_options.keys()))
+
+# ── PDF password ───────────────────────────────────────────────────────────────
+# Check whether a password has already been saved for this account.
+_has_saved_pw = False
+try:
+    _pw_check = requests.get(
+        f"{PARSER_URL}/passwords/{quote(selected_account, safe='')}",
+        timeout=5,
+    )
+    if _pw_check.ok:
+        _has_saved_pw = _pw_check.json().get("has_password", False)
+except Exception:
+    pass  # parser unavailable — treat as no saved password
+
+if _has_saved_pw:
+    _col_pw, _col_btn = st.columns([5, 1])
+    with _col_pw:
+        st.info(f"🔒 PDF password saved for **{selected_account}**")
+    with _col_btn:
+        if st.button("Remove", key="remove_pw", help="Forget the saved password for this account"):
+            try:
+                requests.delete(
+                    f"{PARSER_URL}/passwords/{quote(selected_account, safe='')}",
+                    timeout=5,
+                )
+                st.rerun()
+            except Exception as _e:
+                st.warning(f"Could not remove saved password: {_e}")
+    pdf_password = st.text_input(
+        "Override password (optional)",
+        type="password",
+        placeholder="Leave blank to use saved password, or enter a new one to replace it",
+        key="pdf_password",
+    )
+else:
+    pdf_password = st.text_input(
+        "PDF password (if protected)",
+        type="password",
+        placeholder="Leave blank if not required — entered password will be saved for this account",
+        key="pdf_password",
+    )
 
 # ── File uploader ─────────────────────────────────────────────────────────────
 st.subheader("2. Upload statement")
@@ -149,11 +193,27 @@ if uploaded_file is not None:
                     resp = requests.post(
                         f"{PARSER_URL}/parse",
                         files={"file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")},
-                        data={"account_name": selected_account},
+                        data={"account_name": selected_account, "password": pdf_password or ""},
                         timeout=180,
                     )
                     resp.raise_for_status()
-                    st.session_state["parse_result"] = resp.json()
+                    result = resp.json()
+
+                    # Handle password errors before storing the result
+                    if result.get("status") == "password_required":
+                        st.error(
+                            "🔒 This PDF is password-protected. "
+                            "Enter the password in the **PDF password** field above and try again."
+                        )
+                        st.stop()
+                    elif result.get("status") == "password_incorrect":
+                        st.error(
+                            "❌ Incorrect PDF password. "
+                            "Please check the password and try again."
+                        )
+                        st.stop()
+
+                    st.session_state["parse_result"] = result
             except Exception as exc:
                 st.error(f"Parser error: {exc}")
                 st.stop()
@@ -199,6 +259,10 @@ if "parse_result" in st.session_state:
     # ── Import button ──────────────────────────────────────────────────────────
     st.subheader("5. Import to Firefly")
     if st.button("Import to Firefly", type="primary", disabled=len(final_transactions) == 0):
+        # Re-stamp account_name — data_editor can silently lose it
+        for txn in final_transactions:
+            if not txn.get("account_name"):
+                txn["account_name"] = selected_account
         with st.spinner("Pushing to Firefly III..."):
             try:
                 import_resp = requests.post(
@@ -223,7 +287,10 @@ if "parse_result" in st.session_state:
                     st.session_state["import_history"] = history[:10]
                     del st.session_state["parse_result"]
                 else:
-                    st.error(f"Import failed: {import_result.get('error')}")
+                    errors = import_result.get("errors") or [import_result.get("error", "Unknown error")]
+                    st.error(f"Import failed ({import_result.get('error_count', '?')} errors). First error: {errors[0] if errors else 'Unknown'}")
+                    with st.expander("All errors"):
+                        st.write(errors)
             except Exception as exc:
                 st.error(f"Import error: {exc}")
 

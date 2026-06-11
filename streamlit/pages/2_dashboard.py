@@ -8,6 +8,8 @@ from dateutil.relativedelta import relativedelta
 from auth import require_login
 from firefly_api import get_transactions, get_accounts
 
+st.set_page_config(page_title="Dashboard — Household Finance", page_icon="💰", layout="wide")
+
 _, _, authentication_status = require_login()
 if not authentication_status:
     st.stop()

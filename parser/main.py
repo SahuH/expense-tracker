@@ -1,6 +1,8 @@
 import os
+import json
 import tempfile
 import logging
+from pathlib import Path
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import JSONResponse
 
@@ -13,19 +15,62 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="PDF Parser Service", version="1.0.0")
 
+# Passwords are stored in a Docker volume so they survive container restarts.
+# The file contains plaintext passwords — acceptable for a self-hosted household app
+# on a private server where the operator already has full disk access.
+_PASSWORDS_FILE = Path(os.getenv("PASSWORDS_FILE", "/data/passwords.json"))
+
+
+def _load_passwords() -> dict:
+    try:
+        return json.loads(_PASSWORDS_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_password(account_name: str, password: str) -> None:
+    passwords = _load_passwords()
+    passwords[account_name] = password
+    _PASSWORDS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _PASSWORDS_FILE.write_text(json.dumps(passwords, indent=2))
+
+
+def _delete_password(account_name: str) -> None:
+    passwords = _load_passwords()
+    if account_name in passwords:
+        passwords.pop(account_name)
+        _PASSWORDS_FILE.write_text(json.dumps(passwords, indent=2))
+
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
+@app.get("/passwords/{account_name}")
+def get_password_status(account_name: str):
+    """Return whether a saved PDF password exists for this account (never returns the password itself)."""
+    return {"has_password": account_name in _load_passwords()}
+
+
+@app.delete("/passwords/{account_name}")
+def remove_password(account_name: str):
+    """Delete the saved PDF password for an account."""
+    _delete_password(account_name)
+    return {"success": True}
+
+
 @app.post("/parse")
 async def parse_statement(
     file: UploadFile = File(...),
     account_name: str = Form(...),
+    password: str = Form(default=""),
 ):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are accepted")
+
+    # Use caller-supplied password; fall back to saved password for this account
+    effective_password = password or _load_passwords().get(account_name, "")
 
     # Write upload to a temp file; delete immediately after processing
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
@@ -35,7 +80,24 @@ async def parse_statement(
 
     try:
         logger.info("Extracting transactions from %s", file.filename)
-        result = extract_with_pdfplumber(tmp_path, account_name)
+        result = extract_with_pdfplumber(tmp_path, account_name, effective_password)
+
+        # PDF is encrypted and the password was wrong or missing — bubble up to UI
+        if result.get("error") in ("password_required", "password_incorrect"):
+            return JSONResponse(content={
+                "status": result["error"],
+                "extraction_method": "pdfplumber",
+                "confidence": 0.0,
+                "metadata": {},
+                "transactions": [],
+                "balance_check": {},
+            })
+
+        # A newly-supplied password worked — save it for future uploads of this account
+        if password and password != _load_passwords().get(account_name):
+            _save_password(account_name, password)
+            logger.info("Saved PDF password for account: %s", account_name)
+
         verification = verify_balance(result["transactions"], result.get("metadata", {}))
 
         response = {

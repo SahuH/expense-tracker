@@ -5,6 +5,8 @@ from datetime import date
 from auth import require_login
 from firefly_api import get_transactions, get_accounts, get_categories
 
+st.set_page_config(page_title="Transactions — Household Finance", page_icon="💰", layout="wide")
+
 _, _, authentication_status = require_login()
 if not authentication_status:
     st.stop()

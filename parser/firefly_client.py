@@ -21,9 +21,14 @@ def _headers() -> dict:
 
 
 def _build_payload(txn: dict) -> dict:
+    import math
     txn_type = txn.get("type", "debit")
     amount = str(round(float(txn.get("amount", 0)), 2))
-    account_name = txn.get("account_name", "")
+    raw_account = txn.get("account_name")
+    # Sanitise None / NaN that can come from the data_editor
+    if raw_account is None or (isinstance(raw_account, float) and math.isnan(raw_account)):
+        raw_account = ""
+    account_name = str(raw_account).strip()
     date = txn.get("date", "")
     # Firefly expects YYYY-MM-DD; handle common variants
     if date and len(date) > 10:
@@ -75,6 +80,9 @@ def push_to_firefly(transactions: list[dict]) -> dict:
             imported += 1
         except requests.RequestException as exc:
             msg = str(exc)
+            if hasattr(exc, "response") and exc.response is not None:
+                msg += f" | body: {exc.response.text[:300]}"
+            logger.warning("Failed txn payload: %s", payload)
             logger.warning("Failed to import transaction %s: %s", txn.get("description"), msg)
             errors.append(msg)
 

@@ -73,6 +73,8 @@ services:
     environment:
       FIREFLY_URL: http://firefly:8080
       FIREFLY_ACCESS_TOKEN: ${FIREFLY_ACCESS_TOKEN}
+    volumes:
+      - parser_data:/data
     networks:
       - backend
       - frontend
@@ -124,6 +126,7 @@ volumes:
   firefly_uploads:
   caddy_data:
   caddy_config:
+  parser_data:
 
 networks:
   backend:
