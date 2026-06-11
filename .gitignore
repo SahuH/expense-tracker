@@ -1,0 +1,8 @@
+.env
+streamlit/config.yaml
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.log
+backups/

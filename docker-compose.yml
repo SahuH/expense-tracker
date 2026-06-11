@@ -1,0 +1,132 @@
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  firefly:
+    image: fireflyiii/core:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      APP_KEY: ${FIREFLY_APP_KEY}
+      DB_CONNECTION: pgsql
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: ${POSTGRES_DB}
+      DB_USERNAME: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      APP_URL: https://${DOMAIN}
+      TRUSTED_PROXIES: "**"
+      DEFAULT_LANGUAGE: en_US
+      DEFAULT_LOCALE: equal
+      TZ: ${TIMEZONE}
+    volumes:
+      - firefly_uploads:/var/www/html/storage/upload
+    networks:
+      - backend
+      - frontend
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+  firefly-importer:
+    image: fireflyiii/data-importer:latest
+    restart: unless-stopped
+    depends_on:
+      firefly:
+        condition: service_healthy
+    environment:
+      FIREFLY_III_URL: http://firefly:8080
+      FIREFLY_III_ACCESS_TOKEN: ${FIREFLY_ACCESS_TOKEN}
+      VANITY_URL: https://${DOMAIN}
+      TZ: ${TIMEZONE}
+    networks:
+      - backend
+      - frontend
+
+  parser:
+    build:
+      context: ./parser
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - firefly-importer
+    environment:
+      FIREFLY_URL: http://firefly:8080
+      FIREFLY_ACCESS_TOKEN: ${FIREFLY_ACCESS_TOKEN}
+    networks:
+      - backend
+      - frontend
+
+  streamlit:
+    build:
+      context: ./streamlit
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - parser
+      - firefly
+      - postgres
+    environment:
+      FIREFLY_URL: http://firefly:8080
+      FIREFLY_ACCESS_TOKEN: ${FIREFLY_ACCESS_TOKEN}
+      PARSER_URL: http://parser:8000
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      TZ: ${TIMEZONE}
+    networks:
+      - backend
+      - frontend
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - frontend
+    depends_on:
+      - firefly
+      - streamlit
+      - firefly-importer
+
+volumes:
+  postgres_data:
+  firefly_uploads:
+  caddy_data:
+  caddy_config:
+
+networks:
+  backend:
+    driver: bridge
+  frontend:
+    driver: bridge

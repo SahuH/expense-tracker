@@ -1,0 +1,27 @@
+services:
+
+  firefly:
+    ports:
+      - "8080:8080"
+    environment:
+      APP_URL: http://localhost:8080
+
+  firefly-importer:
+    ports:
+      - "8082:8080"
+    environment:
+      VANITY_URL: http://localhost:8082
+      FIREFLY_III_URL: http://firefly:8080
+
+  parser:
+    ports:
+      - "8000:8000"
+
+  streamlit:
+    ports:
+      - "8501:8501"
+
+  # Exclude Caddy locally — services are accessed directly by port
+  caddy:
+    profiles:
+      - production

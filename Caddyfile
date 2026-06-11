@@ -1,0 +1,40 @@
+{$DOMAIN} {
+    # Streamlit dashboard — default route
+    handle /dashboard* {
+        reverse_proxy streamlit:8501
+    }
+
+    # Firefly III Data Importer
+    handle /import* {
+        reverse_proxy firefly-importer:8080
+    }
+
+    # Parser service (internal; still exposed under /api/parser for debugging)
+    handle /api/parser* {
+        uri strip_prefix /api/parser
+        reverse_proxy parser:8000
+    }
+
+    # Firefly III — everything else
+    handle {
+        reverse_proxy firefly:8080
+    }
+
+    # Streamlit websocket support
+    @websocket {
+        header Connection *Upgrade*
+        header Upgrade websocket
+    }
+    handle @websocket {
+        reverse_proxy streamlit:8501
+    }
+
+    tls {
+        protocols tls1.2 tls1.3
+    }
+
+    encode gzip
+    log {
+        output file /var/log/caddy/access.log
+    }
+}
