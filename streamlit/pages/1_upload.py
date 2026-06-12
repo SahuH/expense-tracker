@@ -6,37 +6,47 @@ import os
 from urllib.parse import quote
 
 from auth import require_login
+from sidebar import render_sidebar
+from utils import apply_theme, step_indicator
 from firefly_api import get_accounts
 
-st.set_page_config(page_title="Upload & Import — Household Finance", page_icon="💰", layout="wide")
+st.set_page_config(
+    page_title="Upload & Import — Household Finance",
+    page_icon="💰",
+    layout="wide",
+)
+
+apply_theme()
 
 _, _, authentication_status = require_login()
 if not authentication_status:
     st.stop()
 
+render_sidebar()
+
 PARSER_URL = os.getenv("PARSER_URL", "http://parser:8000")
 
 st.title("Upload & Import")
 
-# ── Account selector ──────────────────────────────────────────────────────────
+# ── 1. Account selector ───────────────────────────────────────────────────────
 st.subheader("1. Select account")
-try:
-    raw_accounts = get_accounts()
-    account_options = {a["attributes"]["name"]: a["id"] for a in raw_accounts}
-except Exception as exc:
-    st.warning(f"Could not fetch accounts from Firefly: {exc}")
-    account_options = {
-        "Joint Current Account": "0",
-        "Harsh Savings": "1",
-        "Wife Savings": "2",
-        "Harsh Credit Card": "3",
-        "Wife Credit Card": "4",
-    }
+with st.spinner("Loading accounts…"):
+    try:
+        raw_accounts = get_accounts()
+        account_options = {a["attributes"]["name"]: a["id"] for a in raw_accounts}
+    except Exception as exc:
+        st.warning(f"Could not fetch accounts from Firefly: {exc}")
+        account_options = {
+            "Joint Current Account": "0",
+            "Harsh Savings": "1",
+            "Wife Savings": "2",
+            "Harsh Credit Card": "3",
+            "Wife Credit Card": "4",
+        }
 
 selected_account = st.selectbox("Account", list(account_options.keys()))
 
-# ── PDF password ───────────────────────────────────────────────────────────────
-# Check whether a password has already been saved for this account.
+# ── PDF password ──────────────────────────────────────────────────────────────
 _has_saved_pw = False
 try:
     _pw_check = requests.get(
@@ -46,7 +56,7 @@ try:
     if _pw_check.ok:
         _has_saved_pw = _pw_check.json().get("has_password", False)
 except Exception:
-    pass  # parser unavailable — treat as no saved password
+    pass
 
 if _has_saved_pw:
     _col_pw, _col_btn = st.columns([5, 1])
@@ -72,38 +82,39 @@ else:
     pdf_password = st.text_input(
         "PDF password (if protected)",
         type="password",
-        placeholder="Leave blank if not required — entered password will be saved for this account",
+        placeholder="Leave blank if not required — will be saved automatically on first success",
         key="pdf_password",
     )
 
-# ── File uploader ─────────────────────────────────────────────────────────────
+# ── 2. File uploader ──────────────────────────────────────────────────────────
 st.subheader("2. Upload statement")
 uploaded_file = st.file_uploader("Choose a PDF or CSV file", type=["pdf", "csv"])
 
+# ── Step indicator (position after file upload so we know current state) ──────
+if "parse_result" in st.session_state:
+    _step = 4
+elif uploaded_file is not None:
+    _step = 3
+else:
+    _step = 2
 
+step_indicator(["Account", "Upload File", "Parse", "Review & Import"], _step)
+
+
+# ── CSV parser ────────────────────────────────────────────────────────────────
 def _parse_csv(file_bytes: bytes, account_name: str) -> dict:
-    """
-    Read a bank CSV and map it to the standard transaction schema.
-    Handles common column name variants from UAE banks (WIO, ENBD, ADCB, FAB, etc.)
-    """
     df = pd.read_csv(io.BytesIO(file_bytes))
     df.columns = [c.strip().lower() for c in df.columns]
 
     col_map = {}
-
-    # Date
     for c in df.columns:
         if any(k in c for k in ("date", "txn date", "value date", "transaction date")):
             col_map["date"] = c
             break
-
-    # Description
     for c in df.columns:
         if any(k in c for k in ("description", "narration", "particular", "details", "merchant", "remarks")):
             col_map["description"] = c
             break
-
-    # Debit / credit as separate columns (most UAE banks)
     for c in df.columns:
         if any(k in c for k in ("debit", "withdrawal", "dr amount", "debit amount")):
             col_map["debit"] = c
@@ -112,8 +123,6 @@ def _parse_csv(file_bytes: bytes, account_name: str) -> dict:
         if any(k in c for k in ("credit", "deposit", "cr amount", "credit amount")):
             col_map["credit"] = c
             break
-
-    # Single amount column (WIO / some banks)
     if "debit" not in col_map and "credit" not in col_map:
         for c in df.columns:
             if c in ("amount", "transaction amount", "txn amount"):
@@ -125,9 +134,8 @@ def _parse_csv(file_bytes: bytes, account_name: str) -> dict:
         date_val = str(row.get(col_map.get("date", ""), "")).strip()
         desc = str(row.get(col_map.get("description", ""), "")).strip()
 
-        # Determine amount and type
         if "debit" in col_map or "credit" in col_map:
-            debit_raw = row.get(col_map.get("debit", ""), None)
+            debit_raw  = row.get(col_map.get("debit", ""),  None)
             credit_raw = row.get(col_map.get("credit", ""), None)
             try:
                 debit = float(str(debit_raw).replace(",", "")) if pd.notna(debit_raw) and str(debit_raw).strip() not in ("", "-") else 0.0
@@ -137,7 +145,6 @@ def _parse_csv(file_bytes: bytes, account_name: str) -> dict:
                 credit = float(str(credit_raw).replace(",", "")) if pd.notna(credit_raw) and str(credit_raw).strip() not in ("", "-") else 0.0
             except ValueError:
                 credit = 0.0
-
             if debit > 0:
                 amount, txn_type = debit, "debit"
             elif credit > 0:
@@ -149,10 +156,7 @@ def _parse_csv(file_bytes: bytes, account_name: str) -> dict:
                 raw = float(str(row[col_map["amount"]]).replace(",", ""))
             except ValueError:
                 continue
-            if raw < 0:
-                amount, txn_type = abs(raw), "debit"
-            else:
-                amount, txn_type = raw, "credit"
+            amount, txn_type = (abs(raw), "debit") if raw < 0 else (raw, "credit")
         else:
             continue
 
@@ -179,12 +183,14 @@ def _parse_csv(file_bytes: bytes, account_name: str) -> dict:
     }
 
 
+# ── Parse button ──────────────────────────────────────────────────────────────
 if uploaded_file is not None:
-    st.info(f"File: {uploaded_file.name} ({uploaded_file.size / 1024:.1f} KB)")
+    c_info, c_parse = st.columns([4, 1])
+    c_info.info(f"📄 **{uploaded_file.name}** — {uploaded_file.size / 1024:.1f} KB")
     is_csv = uploaded_file.name.lower().endswith(".csv")
 
-    if st.button("Parse Statement", type="primary"):
-        with st.spinner("Extracting transactions..."):
+    if c_parse.button("Parse", type="primary", use_container_width=True):
+        with st.spinner("Extracting transactions…"):
             try:
                 if is_csv:
                     result = _parse_csv(uploaded_file.getvalue(), selected_account)
@@ -199,71 +205,85 @@ if uploaded_file is not None:
                     resp.raise_for_status()
                     result = resp.json()
 
-                    # Handle password errors before storing the result
                     if result.get("status") == "password_required":
-                        st.error(
-                            "🔒 This PDF is password-protected. "
-                            "Enter the password in the **PDF password** field above and try again."
-                        )
+                        st.error("🔒 This PDF is password-protected. Enter the password in the field above and try again.")
                         st.stop()
                     elif result.get("status") == "password_incorrect":
-                        st.error(
-                            "❌ Incorrect PDF password. "
-                            "Please check the password and try again."
-                        )
+                        st.error("❌ Incorrect PDF password. Please check and try again.")
                         st.stop()
 
                     st.session_state["parse_result"] = result
             except Exception as exc:
                 st.error(f"Parser error: {exc}")
                 st.stop()
+        st.rerun()
 
-# ── Show parse result ─────────────────────────────────────────────────────────
+# ── 3. Verification result ────────────────────────────────────────────────────
 if "parse_result" in st.session_state:
     result = st.session_state["parse_result"]
     transactions = result.get("transactions", [])
     balance_check = result.get("balance_check", {})
     status = result.get("status", "unknown")
 
-    st.subheader("3. Verification result")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Transactions found", len(transactions))
-    col2.metric("Method", result.get("extraction_method", "—"))
+    st.subheader("3. Verification")
+    v1, v2, v3 = st.columns(3)
+    v1.metric("Transactions found", len(transactions))
+    v2.metric("Method", result.get("extraction_method", "—"))
 
     if balance_check.get("passed"):
-        col3.success("Balance check PASSED")
+        v3.success("✅ Balance check passed")
+    elif result.get("extraction_method") == "csv":
+        v3.info("ℹ️ CSV — balance check skipped")
     else:
-        reason = balance_check.get("reason", "")
-        if result.get("extraction_method") == "csv":
-            col3.info("CSV — balance check skipped")
-        else:
-            col3.error(f"Balance check FAILED: {reason}")
+        v3.error(f"⚠️ Balance check failed: {balance_check.get('reason', '')}")
 
     if balance_check and result.get("extraction_method") != "csv":
         with st.expander("Balance details"):
             st.json(balance_check)
 
-    # ── Editable transaction table ─────────────────────────────────────────────
+    # ── 4. Editable transaction table ─────────────────────────────────────────
     st.subheader("4. Transactions")
+
     df = pd.DataFrame(transactions)
+    if not df.empty and "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
+    _col_config = {
+        "date":         st.column_config.DateColumn("Date",         format="YYYY-MM-DD"),
+        "description":  st.column_config.TextColumn("Description",  width="large"),
+        "amount":       st.column_config.NumberColumn("Amount",     format="AED %.2f", min_value=0),
+        "type":         st.column_config.SelectboxColumn("Type",    options=["debit", "credit"]),
+        "account_name": st.column_config.TextColumn("Account"),
+        "currency":     st.column_config.SelectboxColumn("Currency",options=["AED", "USD", "EUR", "GBP", "INR"]),
+        "balance_after":st.column_config.NumberColumn("Balance after", format="AED %.2f"),
+    }
 
     if status == "needs_review":
         if result.get("extraction_method") != "csv":
-            st.warning("Manual review required — edit transactions before importing.")
-        edited_df = st.data_editor(df, use_container_width=True, num_rows="dynamic")
+            st.warning("Manual review required — edit any rows before importing.")
+        edited_df = st.data_editor(
+            df,
+            use_container_width=True,
+            num_rows="dynamic",
+            column_config=_col_config,
+        )
+        # Convert date back to string for the import payload
+        edited_df["date"] = edited_df["date"].apply(
+            lambda d: str(d)[:10] if pd.notna(d) else ""
+        )
         final_transactions = edited_df.to_dict(orient="records")
     else:
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, use_container_width=True, column_config=_col_config, hide_index=True)
         final_transactions = transactions
 
-    # ── Import button ──────────────────────────────────────────────────────────
+    # ── 5. Import ─────────────────────────────────────────────────────────────
     st.subheader("5. Import to Firefly")
-    if st.button("Import to Firefly", type="primary", disabled=len(final_transactions) == 0):
-        # Re-stamp account_name — data_editor can silently lose it
+    imp_col, _ = st.columns([2, 6])
+    if imp_col.button("Import to Firefly", type="primary", use_container_width=True, disabled=len(final_transactions) == 0):
         for txn in final_transactions:
             if not txn.get("account_name"):
                 txn["account_name"] = selected_account
-        with st.spinner("Pushing to Firefly III..."):
+        with st.spinner("Pushing to Firefly III…"):
             try:
                 import_resp = requests.post(
                     f"{PARSER_URL}/import",
@@ -274,21 +294,20 @@ if "parse_result" in st.session_state:
                 import_result = import_resp.json()
 
                 if import_result.get("success"):
-                    st.success(
-                        f"Successfully imported {import_result.get('imported_count', 0)} transactions!"
-                    )
+                    st.success(f"✅ Imported {import_result.get('imported_count', 0)} transactions!")
                     history = st.session_state.get("import_history", [])
                     history.insert(0, {
-                        "account": selected_account,
-                        "count": import_result.get("imported_count", 0),
-                        "status": "success",
-                        "method": result.get("extraction_method"),
+                        "Account": selected_account,
+                        "Imported": import_result.get("imported_count", 0),
+                        "Status": "✅ Success",
+                        "Method": result.get("extraction_method"),
                     })
                     st.session_state["import_history"] = history[:10]
                     del st.session_state["parse_result"]
+                    st.rerun()
                 else:
                     errors = import_result.get("errors") or [import_result.get("error", "Unknown error")]
-                    st.error(f"Import failed ({import_result.get('error_count', '?')} errors). First error: {errors[0] if errors else 'Unknown'}")
+                    st.error(f"Import failed ({import_result.get('error_count', '?')} errors). First: {errors[0] if errors else '?'}")
                     with st.expander("All errors"):
                         st.write(errors)
             except Exception as exc:
@@ -299,6 +318,16 @@ st.markdown("---")
 st.subheader("Import history (this session)")
 history = st.session_state.get("import_history", [])
 if history:
-    st.dataframe(pd.DataFrame(history), use_container_width=True)
+    st.dataframe(
+        pd.DataFrame(history),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Account":  st.column_config.TextColumn("Account"),
+            "Imported": st.column_config.NumberColumn("Imported", format="%d txns"),
+            "Status":   st.column_config.TextColumn("Status"),
+            "Method":   st.column_config.TextColumn("Method"),
+        },
+    )
 else:
-    st.caption("No imports yet in this session.")
+    st.caption("No imports yet this session.")

@@ -19,6 +19,10 @@ def require_login():
         config["cookie"]["expiry_days"],
     )
 
+    # Store so sidebar.py can reuse this instance for logout without
+    # constructing a second Authenticate (which would crash with DuplicateWidgetID).
+    st.session_state["_authenticator"] = authenticator
+
     authenticator.login(location="main")
 
     name = st.session_state.get("name")
