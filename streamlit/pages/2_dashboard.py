@@ -30,6 +30,15 @@ COLORS = {
 CAT_COLORS = px.colors.qualitative.Set2
 
 
+def _fmt(x: float) -> str:
+    """Smart number formatter: integer for <1k, 1-dp k for ≥1k, 1-dp M for ≥1M."""
+    if abs(x) >= 1_000_000:
+        return f"{x / 1_000_000:.1f}M"
+    if abs(x) >= 1_000:
+        return f"{x / 1_000:.1f}k"
+    return f"{x:.0f}"
+
+
 def _load_transactions(start: str, end: str, account_id: str = None) -> pd.DataFrame:
     raw = get_transactions(start=start, end=end, account_id=account_id)
     rows = []
@@ -167,7 +176,8 @@ with r1c1:
         fig.update_traces(
             textposition="inside",
             textinfo="percent+label",
-            hovertemplate="<b>%{label}</b><br>AED %{value:,.2f}  (%{percent})<extra></extra>",
+            customdata=cat_df["amount"].map(_fmt),
+            hovertemplate="<b>%{label}</b><br>AED %{customdata}  (%{percent})<extra></extra>",
         )
         fig.update_layout(
             showlegend=True,
@@ -209,19 +219,26 @@ with r2c1:
         daily = daily_s.reindex(date_range, fill_value=0).reset_index()
         daily.columns = ["date", "amount"]
         daily["7d_avg"] = daily["amount"].rolling(7, min_periods=1).mean()
+        daily["fmt"] = daily["amount"].map(_fmt)
+        daily["avg_fmt"] = daily["7d_avg"].map(_fmt)
 
         fig = go.Figure()
         fig.add_trace(go.Bar(
             x=daily["date"], y=daily["amount"],
             name="Daily", marker_color=COLORS["bar"],
+            customdata=daily["fmt"],
+            hovertemplate="Daily: AED %{customdata}<extra></extra>",
         ))
         fig.add_trace(go.Scatter(
             x=daily["date"], y=daily["7d_avg"],
             name="7-day avg", mode="lines",
             line=dict(color=COLORS["ma"], width=2.5),
+            customdata=daily["avg_fmt"],
+            hovertemplate="7-day avg: AED %{customdata}<extra></extra>",
         ))
         fig.update_layout(
             yaxis_title="AED", xaxis_title="", height=320,
+            yaxis=dict(tickformat=".3~s"),
             margin=dict(l=0, r=0, t=10, b=0),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             hovermode="x unified", bargap=0.2,
@@ -246,11 +263,12 @@ with r2c2:
         fig = px.bar(
             dow_agg, x="Amount", y="Day", orientation="h",
             color="Amount", color_continuous_scale="Blues",
-            text=dow_agg["Amount"].map(lambda x: f"AED {x:,.0f}"),
+            text=dow_agg["Amount"].map(lambda x: f"AED {_fmt(x)}"),
         )
         fig.update_traces(textposition="outside")
         fig.update_layout(
             xaxis_title="AED", yaxis_title="", height=320,
+            xaxis=dict(tickformat=".3~s"),
             margin=dict(l=0, r=90, t=10, b=0),
             coloraxis_showscale=False,
             yaxis=dict(categoryorder="array", categoryarray=DOW_ORDER[::-1]),
@@ -291,15 +309,20 @@ if have_6m:
     fig.add_trace(go.Bar(
         x=mom["month_label"], y=mom["Spend"], name="Spend",
         marker_color=COLORS["spend"],
-        text=mom["Spend"].map(lambda x: f"{x:,.0f}"), textposition="outside",
+        text=mom["Spend"].map(_fmt), textposition="outside",
+        customdata=mom["Spend"].map(_fmt),
+        hovertemplate="Spend: AED %{customdata}<extra></extra>",
     ))
     fig.add_trace(go.Bar(
         x=mom["month_label"], y=mom["Income"], name="Income",
         marker_color=COLORS["income"],
-        text=mom["Income"].map(lambda x: f"{x:,.0f}"), textposition="outside",
+        text=mom["Income"].map(_fmt), textposition="outside",
+        customdata=mom["Income"].map(_fmt),
+        hovertemplate="Income: AED %{customdata}<extra></extra>",
     ))
     fig.update_layout(
         barmode="group", yaxis_title="AED", xaxis_title="", height=320,
+        yaxis=dict(tickformat=".3~s"),
         margin=dict(l=0, r=0, t=30, b=0),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         hovermode="x unified",
@@ -334,8 +357,13 @@ with r4c1:
                 ct, x="month_label", y="amount", color="category",
                 markers=True, color_discrete_sequence=CAT_COLORS,
             )
+            fig.update_traces(
+                customdata=ct["amount"].map(_fmt),
+                hovertemplate="%{fullData.name}: AED %{customdata}<extra></extra>",
+            )
             fig.update_layout(
                 yaxis_title="AED", xaxis_title="", height=300,
+                yaxis=dict(tickformat=".3~s"),
                 margin=dict(l=0, r=0, t=10, b=0),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             )
@@ -359,11 +387,12 @@ with r4c2:
         fig = px.bar(
             acct_df, x="Amount", y="Account", orientation="h",
             color="Amount", color_continuous_scale="Purples",
-            text=acct_df["Amount"].map(lambda x: f"AED {x:,.0f}"),
+            text=acct_df["Amount"].map(lambda x: f"AED {_fmt(x)}"),
         )
         fig.update_traces(textposition="outside")
         fig.update_layout(
             xaxis_title="AED", yaxis_title="", height=300,
+            xaxis=dict(tickformat=".3~s"),
             margin=dict(l=0, r=90, t=10, b=0),
             coloraxis_showscale=False,
         )

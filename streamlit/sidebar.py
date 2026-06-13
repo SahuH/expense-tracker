@@ -24,3 +24,5 @@ def render_sidebar():
     st.sidebar.page_link("pages/2_dashboard.py",     label="📊  Dashboard")
     st.sidebar.page_link("pages/3_transactions.py",  label="📋  Transactions")
     st.sidebar.page_link("pages/4_ask_ai.py",        label="🤖  Ask AI")
+    st.sidebar.page_link("pages/5_rules.py",         label="⚙️  Rules")
+    st.sidebar.page_link("pages/6_categories.py",    label="🏷️  Categories")

@@ -28,6 +28,52 @@ _BANK_PREFIXES = (
     "mashreq ", "hsbc ", "citibank ", "rakbank ",
 )
 
+# Built-in transfer rules derived from known account patterns in this household.
+# Each rule has:
+#   keyword     – substring (or exact string if match="exact") to find in description
+#   match       – "contains" (default) or "exact"
+#   action      – "skip": drop this transaction (it's the destination side of a transfer
+#                          that will be imported from the source account's statement)
+#               – omitted / "transfer": import as a Firefly transfer to other_account
+#   other_account – Firefly asset-account name for the counterpart (required for transfer)
+#
+# User-defined rules (stored in /data/transfer_rules.json) are checked first and can
+# override these defaults by matching the same keyword earlier in the list.
+_DEFAULT_TRANSFER_RULES: dict = {
+    # ── Wio bank account ──────────────────────────────────────────────────────
+    "Wio bank account": [
+        # Wio → Fixed Saving Space deposit (debit/source side)
+        {"keyword": "to Fixed Saving Space", "other_account": "Wio Fixed Saving Space"},
+        # FSS → Wio withdrawal arriving (credit/destination; FSS debit imports it)
+        {"keyword": "Fixed Saving Space to Harsh", "action": "skip"},
+        # Wio → FAB self-transfer (debit/source side)
+        {"keyword": "To Harsh Sahu Shiv Kumar Sahu", "other_account": "First Abu Dhabi Bank (FAB)  bank account"},
+        # FAB → Wio self-transfer arriving (credit/destination; FAB IPP debit imports it)
+        {"keyword": "From Harsh Sahu Shiv Kumar Sahu", "action": "skip"},
+    ],
+    # ── Wio Fixed Saving Space ────────────────────────────────────────────────
+    "Wio Fixed Saving Space": [
+        # FSS → Wio withdrawal (debit/source side)
+        {"keyword": "Fixed Saving Space to Harsh", "other_account": "Wio bank account"},
+        # Wio → FSS deposit arriving (credit/destination; Wio bank debit imports it)
+        {"keyword": "to Fixed Saving Space", "action": "skip"},
+    ],
+    # ── First Abu Dhabi Bank (FAB) bank account ───────────────────────────────
+    "First Abu Dhabi Bank (FAB)  bank account": [
+        # FAB → Wio via IPP/IPI (Wio IBAN AE160860000006198732111 appears in description)
+        {"keyword": "AE160860000006198732111", "other_account": "Wio bank account"},
+        # CC bill payment — description is exactly "Transfer" on FAB bank side
+        {"keyword": "Transfer", "match": "exact", "other_account": "FAB Credit Card"},
+        # Wio → FAB arriving (WIOB AEAD = Wio Bank SWIFT; credit/destination side)
+        {"keyword": "WIOB AEAD", "action": "skip"},
+    ],
+    # ── FAB Credit Card ───────────────────────────────────────────────────────
+    "FAB Credit Card": [
+        # CC payment arriving (credit/destination; FAB bank "Transfer" debit imports it)
+        {"keyword": "PAYMENT RECEIVED", "action": "skip"},
+    ],
+}
+
 
 def _headers() -> dict:
     return {
@@ -56,13 +102,27 @@ def _get_asset_accounts() -> list[dict]:
 
 def _check_transfer_rules(
     description: str, account_name: str, transfer_rules: dict
-) -> str | None:
-    """Return the other-account name if a user-defined keyword rule matches."""
+) -> tuple[str | None, str | None]:
+    """
+    Return (action, other_account) for the first matching rule.
+    action is 'skip', 'transfer', or None (no match).
+    Supports match="exact" for rules that must match the full description.
+    """
     desc_lower = description.lower()
     for rule in transfer_rules.get(account_name, []):
-        if rule.get("keyword", "").lower() in desc_lower:
-            return rule["other_account"]
-    return None
+        kw = rule.get("keyword", "").lower()
+        if not kw:
+            continue
+        if rule.get("match") == "exact":
+            matched = desc_lower == kw
+        else:
+            matched = kw in desc_lower
+        if matched:
+            if rule.get("action") == "skip":
+                return "skip", None
+            if rule.get("other_account"):
+                return "transfer", rule["other_account"]
+    return None, None
 
 
 def _find_transfer_account(
@@ -103,7 +163,8 @@ def _find_transfer_account(
 
 def _build_payload(
     txn: dict, asset_accounts: list | None = None, transfer_rules: dict | None = None
-) -> dict:
+) -> dict | None:
+    """Build a Firefly transaction payload. Returns None if the transaction should be skipped."""
     import math
     txn_type = txn.get("type", "debit")
     amount = str(round(float(txn.get("amount", 0)), 2))
@@ -118,10 +179,12 @@ def _build_payload(
     currency = txn.get("currency", "AED")
 
     # ── Transfer detection ────────────────────────────────────────────────────
-    # Keyword rules take priority (explicit user config), then account-name detection.
+    # Keyword rules take priority (user-defined + defaults), then account-name detection.
     transfer_account = None
     if transfer_rules and description:
-        transfer_account = _check_transfer_rules(description, account_name, transfer_rules)
+        action, transfer_account = _check_transfer_rules(description, account_name, transfer_rules)
+        if action == "skip":
+            return None  # destination side of a transfer; source account's statement imports it
     if not transfer_account and asset_accounts and description:
         transfer_account = _find_transfer_account(description, account_name, asset_accounts)
 
@@ -178,15 +241,297 @@ def _build_payload(
 
 # ─── Main entry point ─────────────────────────────────────────────────────────
 
+def get_effective_transfer_rules() -> dict:
+    """
+    Return all active rules (user-defined + built-in defaults) with an _origin tag.
+    Used by the API to drive the Rules UI page.
+    """
+    from pathlib import Path
+    rules_path = Path(os.getenv("TRANSFER_RULES_FILE", "/data/transfer_rules.json"))
+    try:
+        user_rules: dict = json.loads(rules_path.read_text())
+    except Exception:
+        user_rules = {}
+
+    result: dict = {}
+    for account in sorted(set(list(user_rules.keys()) + list(_DEFAULT_TRANSFER_RULES.keys()))):
+        user_list = [{"_origin": "user", **r} for r in user_rules.get(account, [])]
+        builtin_list = [{"_origin": "builtin", **r} for r in _DEFAULT_TRANSFER_RULES.get(account, [])]
+        result[account] = user_list + builtin_list
+    return result
+
+
+def apply_rules_to_existing_transactions() -> dict:
+    """
+    Retroactively apply transfer rules to all existing withdrawal/deposit transactions
+    in Firefly III.
+
+    Pass 1 (withdrawals): source-side transactions matching a transfer rule are updated
+                          to type=transfer.  Skip-action withdrawals are deleted.
+    Pass 2 (deposits):    destination-side deposits matching a skip rule are deleted.
+                          Deposit-side transfers (rare) are also updated.
+
+    Updates run before deletes so source-side transfers exist before destinations are removed.
+    """
+    asset_accounts = _get_asset_accounts()
+    transfer_rules = _load_transfer_rules_from_disk()
+
+    to_update: list[tuple] = []   # (txn_id, description, date, amount, currency, src, dst)
+    to_delete: list[str]  = []
+
+    def _collect(txn_type: str) -> None:
+        page = 1
+        while True:
+            resp = requests.get(
+                f"{FIREFLY_URL}/api/v1/transactions",
+                headers=_headers(),
+                params={"type": txn_type, "limit": 100, "page": page},
+                timeout=30,
+            )
+            if not resp.ok:
+                logger.warning("Could not fetch %s transactions (page %d): %s", txn_type, page, resp.text[:200])
+                break
+            data = resp.json()
+            items = data.get("data", [])
+            if not items:
+                break
+
+            for item in items:
+                txn_id: str = item["id"]
+                splits = item.get("attributes", {}).get("transactions", [])
+                if not splits:
+                    continue
+                split = splits[0]
+
+                description: str = split.get("description", "")
+                date_raw: str = split.get("date", "")
+                date: str = date_raw[:10] if date_raw else ""
+                amount: str = str(split.get("amount", "0"))
+                currency: str = split.get("currency_code", "AED")
+
+                account_name: str = (
+                    split.get("source_name", "") if txn_type == "withdrawal"
+                    else split.get("destination_name", "")
+                )
+                if not description or not account_name:
+                    continue
+
+                action, other_account = _check_transfer_rules(description, account_name, transfer_rules)
+
+                if action == "skip":
+                    to_delete.append(txn_id)
+                elif action == "transfer" and other_account:
+                    src, dst = (
+                        (account_name, other_account) if txn_type == "withdrawal"
+                        else (other_account, account_name)
+                    )
+                    to_update.append((txn_id, description, date, amount, currency, src, dst))
+                elif not action:
+                    # Fallback: auto-detect by account name in description
+                    auto = _find_transfer_account(description, account_name, asset_accounts)
+                    if auto:
+                        src, dst = (
+                            (account_name, auto) if txn_type == "withdrawal"
+                            else (auto, account_name)
+                        )
+                        to_update.append((txn_id, description, date, amount, currency, src, dst))
+
+            pagination = data.get("meta", {}).get("pagination", {})
+            if page >= pagination.get("total_pages", 1):
+                break
+            page += 1
+
+    _collect("withdrawal")
+    _collect("deposit")
+
+    updated, deleted = 0, 0
+    errors: list[str] = []
+
+    # Update source-side transactions to transfers first
+    for txn_id, desc, date, amount, currency, src, dst in to_update:
+        resp = requests.put(
+            f"{FIREFLY_URL}/api/v1/transactions/{txn_id}",
+            headers=_headers(),
+            json={
+                "apply_rules": False,
+                "fire_webhooks": False,
+                "transactions": [{
+                    "type": "transfer",
+                    "date": date,
+                    "amount": amount,
+                    "description": desc,
+                    "source_name": src,
+                    "destination_name": dst,
+                    "currency_code": currency,
+                }],
+            },
+            timeout=15,
+        )
+        if resp.ok:
+            updated += 1
+            logger.info("Converted to transfer: %s → %s (%s)", src, dst, desc[:60])
+        else:
+            errors.append(f"Update {txn_id} ({desc[:40]}): {resp.text[:200]}")
+
+    # Then delete destination-side duplicates
+    for txn_id in to_delete:
+        resp = requests.delete(
+            f"{FIREFLY_URL}/api/v1/transactions/{txn_id}",
+            headers=_headers(),
+            timeout=10,
+        )
+        if resp.ok:
+            deleted += 1
+        else:
+            errors.append(f"Delete {txn_id}: {resp.text[:100]}")
+
+    return {
+        "success": len(errors) == 0,
+        "updated_count": updated,
+        "deleted_count": deleted,
+        "error_count": len(errors),
+        "errors": errors[:10],
+    }
+
+
+def apply_category_rules_to_transactions(rules: list) -> dict:
+    """
+    Apply category rules to all withdrawal/deposit transactions in Firefly III.
+    First matching rule wins (exclusive — a transaction gets at most one category).
+    Skips transfers. Only updates transactions whose category would actually change.
+    """
+    if not rules:
+        return {"success": True, "updated_count": 0, "skipped_count": 0,
+                "error_count": 0, "errors": [], "category_counts": {}}
+
+    # Flatten rules into an ordered lookup list [(pattern, category_name)]
+    lookup: list[tuple[str, str]] = []
+    for rule in rules:
+        subcat = (rule.get("subcategory") or "").strip()
+        cat = (rule.get("category") or "").strip()
+        category_name = subcat if subcat else cat
+        for p in rule.get("patterns", []):
+            p = p.strip().lower()
+            if p:
+                lookup.append((p, category_name))
+
+    def _match(description: str) -> str | None:
+        desc_lower = description.lower()
+        for pattern, category in lookup:
+            if pattern in desc_lower:
+                return category
+        return None
+
+    updated, skipped, errors = 0, 0, []
+    category_counts: dict[str, int] = {}
+
+    def _process_type(txn_type: str) -> None:
+        nonlocal updated, skipped
+        page = 1
+        while True:
+            resp = requests.get(
+                f"{FIREFLY_URL}/api/v1/transactions",
+                headers=_headers(),
+                params={"type": txn_type, "limit": 100, "page": page},
+                timeout=30,
+            )
+            if not resp.ok:
+                errors.append(f"Fetch {txn_type} p{page}: {resp.text[:200]}")
+                break
+            data = resp.json()
+            items = data.get("data", [])
+            if not items:
+                break
+
+            for item in items:
+                txn_id = item["id"]
+                splits = item.get("attributes", {}).get("transactions", [])
+                if not splits:
+                    continue
+                split = splits[0]
+                description = split.get("description", "")
+
+                category = _match(description)
+                if not category:
+                    skipped += 1
+                    continue
+                if split.get("category_name") == category:
+                    skipped += 1
+                    continue
+
+                date = (split.get("date") or "")[:10]
+                amount = str(split.get("amount", "0"))
+                currency = split.get("currency_code", "AED")
+
+                if txn_type == "withdrawal":
+                    entry = {
+                        "type": "withdrawal",
+                        "date": date,
+                        "amount": amount,
+                        "description": description,
+                        "source_name": split.get("source_name", ""),
+                        "currency_code": currency,
+                        "category_name": category,
+                    }
+                else:
+                    entry = {
+                        "type": "deposit",
+                        "date": date,
+                        "amount": amount,
+                        "description": description,
+                        "destination_name": split.get("destination_name", ""),
+                        "currency_code": currency,
+                        "category_name": category,
+                    }
+
+                put_resp = requests.put(
+                    f"{FIREFLY_URL}/api/v1/transactions/{txn_id}",
+                    headers=_headers(),
+                    json={"apply_rules": False, "fire_webhooks": False, "transactions": [entry]},
+                    timeout=15,
+                )
+                if put_resp.ok:
+                    updated += 1
+                    category_counts[category] = category_counts.get(category, 0) + 1
+                    logger.info("Categorized [%s] → %s", description[:60], category)
+                else:
+                    errors.append(f"{txn_id} ({description[:40]}): {put_resp.text[:200]}")
+
+            pagination = data.get("meta", {}).get("pagination", {})
+            if page >= pagination.get("total_pages", 1):
+                break
+            page += 1
+
+    _process_type("withdrawal")
+    _process_type("deposit")
+
+    return {
+        "success": len(errors) == 0,
+        "updated_count": updated,
+        "skipped_count": skipped,
+        "error_count": len(errors),
+        "errors": errors[:10],
+        "category_counts": category_counts,
+    }
+
+
 def _load_transfer_rules_from_disk() -> dict:
-    """Load user-defined keyword transfer rules (written by the parser API)."""
+    """
+    Load transfer rules: user-defined rules (from disk) prepended to built-in defaults.
+    User rules are checked first so they can override or extend defaults.
+    """
     import os
     from pathlib import Path
     rules_path = Path(os.getenv("TRANSFER_RULES_FILE", "/data/transfer_rules.json"))
     try:
-        return json.loads(rules_path.read_text())
+        user_rules: dict = json.loads(rules_path.read_text())
     except Exception:
-        return {}
+        user_rules = {}
+
+    merged: dict = {}
+    for account in set(list(user_rules.keys()) + list(_DEFAULT_TRANSFER_RULES.keys())):
+        merged[account] = user_rules.get(account, []) + _DEFAULT_TRANSFER_RULES.get(account, [])
+    return merged
 
 
 def push_to_firefly(transactions: list[dict]) -> dict:
@@ -199,11 +544,19 @@ def push_to_firefly(transactions: list[dict]) -> dict:
     )
 
     imported = 0
+    skipped = 0
     errors = []
 
     for txn in transactions:
         try:
             payload = _build_payload(txn, asset_accounts, transfer_rules)
+            if payload is None:
+                logger.info(
+                    "Skipping destination-side transfer: %s",
+                    txn.get("description", "")[:80],
+                )
+                skipped += 1
+                continue
             resp = requests.post(
                 f"{FIREFLY_URL}/api/v1/transactions",
                 headers=_headers(),
@@ -223,6 +576,7 @@ def push_to_firefly(transactions: list[dict]) -> dict:
     return {
         "success": len(errors) == 0,
         "imported_count": imported,
+        "skipped_count": skipped,
         "error_count": len(errors),
         "errors": errors[:5],
     }

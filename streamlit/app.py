@@ -87,7 +87,7 @@ st.markdown("---")
 
 # ── Navigation cards ──────────────────────────────────────────────────────────
 st.subheader("Navigate to")
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3, c4, c5, c6 = st.columns(6)
 
 with c1:
     with st.container(border=True):
@@ -112,3 +112,15 @@ with c4:
         st.markdown("#### 🤖 Ask AI")
         st.caption("Ask natural-language questions about your finances, powered by Claude.")
         st.page_link("pages/4_ask_ai.py", label="Open →")
+
+with c5:
+    with st.container(border=True):
+        st.markdown("#### ⚙️ Rules")
+        st.caption("View and apply transfer rules that classify internal transactions automatically.")
+        st.page_link("pages/5_rules.py", label="Open →")
+
+with c6:
+    with st.container(border=True):
+        st.markdown("#### 🏷️ Categories")
+        st.caption("Define and apply category rules that auto-tag transactions by description.")
+        st.page_link("pages/6_categories.py", label="Open →")

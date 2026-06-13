@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
-from datetime import date
+from datetime import date, timedelta
+from dateutil.relativedelta import relativedelta
 
 from auth import require_login
 from sidebar import render_sidebar
@@ -49,14 +50,41 @@ def _flatten(raw: list) -> pd.DataFrame:
     return df
 
 
-# ── Date range + account ──────────────────────────────────────────────────────
+# ── Date presets ──────────────────────────────────────────────────────────────
 today = date.today()
 
+PRESETS = {
+    "This Month": (today.replace(day=1), today),
+    "Last Month": (
+        today.replace(day=1) - relativedelta(months=1),
+        today.replace(day=1) - timedelta(days=1),
+    ),
+    "Last 3M":  (today.replace(day=1) - relativedelta(months=2), today),
+    "YTD":      (today.replace(month=1, day=1), today),
+    "Last 12M": (today - relativedelta(months=12), today),
+}
+
 if "txn_start" not in st.session_state:
-    st.session_state.txn_start = today.replace(year=today.year - 1)
+    st.session_state.txn_start = today.replace(day=1)
 if "txn_end" not in st.session_state:
     st.session_state.txn_end = today
+if "txn_preset" not in st.session_state:
+    st.session_state.txn_preset = "This Month"
 
+preset_cols = st.columns(len(PRESETS) + 4)
+for i, (label, (ps, pe)) in enumerate(PRESETS.items()):
+    is_active = st.session_state.txn_preset == label
+    if preset_cols[i].button(
+        label,
+        type="primary" if is_active else "secondary",
+        use_container_width=True,
+    ):
+        st.session_state.txn_start = ps
+        st.session_state.txn_end = pe
+        st.session_state.txn_preset = label
+        st.rerun()
+
+# ── Date range + account ──────────────────────────────────────────────────────
 col1, col2, col3 = st.columns(3)
 with col1:
     start_date = st.date_input("From", key="txn_start")

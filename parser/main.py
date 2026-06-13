@@ -1,5 +1,6 @@
 import os
 import json
+import uuid
 import tempfile
 import logging
 from pathlib import Path
@@ -8,18 +9,16 @@ from fastapi.responses import JSONResponse
 
 from extractor import extract_with_pdfplumber
 from validator import verify_balance
-from firefly_client import push_to_firefly
+from firefly_client import push_to_firefly, get_effective_transfer_rules, apply_rules_to_existing_transactions
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="PDF Parser Service", version="1.0.0")
 
-# Passwords are stored in a Docker volume so they survive container restarts.
-# The file contains plaintext passwords — acceptable for a self-hosted household app
-# on a private server where the operator already has full disk access.
 _PASSWORDS_FILE = Path(os.getenv("PASSWORDS_FILE", "/data/passwords.json"))
 _TRANSFER_RULES_FILE = Path(os.getenv("TRANSFER_RULES_FILE", "/data/transfer_rules.json"))
+_CATEGORIES_FILE = Path(os.getenv("CATEGORIES_FILE", "/data/categories.json"))
 
 
 def _load_passwords() -> dict:
@@ -41,6 +40,125 @@ def _delete_password(account_name: str) -> None:
     if account_name in passwords:
         passwords.pop(account_name)
         _PASSWORDS_FILE.write_text(json.dumps(passwords, indent=2))
+
+
+# ── Category-rule helpers ─────────────────────────────────────────────────────
+
+_DEFAULT_CATEGORY_RULES: list = [
+    {"id": "food-delivery-001", "category": "Food & Dining", "subcategory": "Food Delivery",
+     "patterns": ["talabat", "deliveroo", "careem food", "hunger station", "noon food"]},
+    {"id": "fast-food-001", "category": "Food & Dining", "subcategory": "Fast Food",
+     "patterns": ["mcdonald", "kfc", "pizza hut", "subway", "burger king", "hardees", "popeyes",
+                  "five guys", "shake shack", "little caesars", "dominos", "papa john"]},
+    {"id": "cafe-coffee-001", "category": "Food & Dining", "subcategory": "Cafes & Coffee",
+     "patterns": ["starbucks", "costa coffee", "tim hortons", "dunkin", "caribou coffee",
+                  "paul cafe", "shakespeare and co", "tchibo", "coffee planet", "second cup"]},
+    {"id": "restaurants-001", "category": "Food & Dining", "subcategory": "Restaurants",
+     "patterns": ["veg world restaurant", "zaatar w zeit", "applebees", "chilis", "nandos",
+                  "wagamama", "cheesecake factory", "pf chang", "ihop", "restaurant"]},
+    {"id": "groceries-001", "category": "Food & Dining", "subcategory": "Groceries",
+     "patterns": ["carrefour", "lulu hypermarket", "lulu express", "union coop", "spinneys",
+                  "waitrose", "al maya", "choithrams", "geant", "west zone", "key pee mart",
+                  "aswaaq", "nesto hypermarket", "viva supermarket", "grandiose", "spar",
+                  "safari hypermarket"]},
+    {"id": "bakeries-001", "category": "Food & Dining", "subcategory": "Bakeries",
+     "patterns": ["paul bakery", "le pain quotidien", "cinnabon", "krispy kreme",
+                  "baskin robbins", "magnolia bakery"]},
+    {"id": "beverages-alcohol-001", "category": "Food & Dining", "subcategory": "Beverages & Alcohol",
+     "patterns": ["mmi dubai", "mmi abu", "maritime mercantile", "african eastern", "le clos"]},
+    {"id": "ride-hailing-001", "category": "Transportation", "subcategory": "Ride Hailing",
+     "patterns": ["careem deliveries", "uber trip", "bolt ride", "indrive", "ola cab"]},
+    {"id": "fuel-petrol-001", "category": "Transportation", "subcategory": "Fuel & Petrol",
+     "patterns": ["adnoc distribution", "adnoc station", "enoc", "eppco", "emarat",
+                  "total energies", "shell station", "caltex"]},
+    {"id": "parking-tolls-001", "category": "Transportation", "subcategory": "Parking & Tolls",
+     "patterns": ["salik", "mawaqif", "parkin", "rta parking", "dubai parking"]},
+    {"id": "utilities-elec-water-001", "category": "Utilities", "subcategory": "Electricity & Water",
+     "patterns": ["dewa", "sewa", "fewa", "addc", "aadc", "aquacool metering",
+                  "empower", "emicool", "district cooling"]},
+    {"id": "utilities-water-delivery-001", "category": "Utilities", "subcategory": "Water Delivery",
+     "patterns": ["al ain water", "masafi delivery", "oasis water", "culligan",
+                  "water delivery", "spring water"]},
+    {"id": "utilities-telecom-001", "category": "Utilities", "subcategory": "Telecom",
+     "patterns": ["etisalat", "du telecom", "du internet", "du mobile", "virgin mobile uae"]},
+    {"id": "shopping-online-001", "category": "Shopping", "subcategory": "Online Shopping",
+     "patterns": ["noon.com", "amazon ae", "amazon.ae", "souq.com", "namshi",
+                  "shein", "6thstreet"]},
+    {"id": "shopping-electronics-001", "category": "Shopping", "subcategory": "Electronics",
+     "patterns": ["sharaf dg", "istore", "plug ins", "jumbo electronics", "emax",
+                  "virgin megastore", "apple store", "axiom telecom"]},
+    {"id": "shopping-clothing-001", "category": "Shopping", "subcategory": "Clothing",
+     "patterns": ["zara", "mango", "gap store", "forever 21", "cotton on",
+                  "marks and spencer", "centrepoint", "max fashion", "levis store",
+                  "brands for less", "splash fashion"]},
+    {"id": "shopping-home-001", "category": "Shopping", "subcategory": "Home & Furniture",
+     "patterns": ["ikea", "pan emirates", "home centre", "pottery barn", "homes r us",
+                  "danube home", "ace hardware"]},
+    {"id": "entertainment-streaming-001", "category": "Entertainment", "subcategory": "Streaming Services",
+     "patterns": ["netflix", "spotify", "apple.com/bill", "apple subscription",
+                  "disney plus", "disneyplus", "starz play", "shahid vip",
+                  "youtube premium", "osn streaming", "anghami"]},
+    {"id": "entertainment-cinema-001", "category": "Entertainment", "subcategory": "Cinema",
+     "patterns": ["vox cinemas", "reel cinemas", "novo cinemas", "cinepolis"]},
+    {"id": "health-pharmacy-001", "category": "Health & Wellness", "subcategory": "Pharmacy",
+     "patterns": ["aster pharmacy", "life pharmacy", "boots pharmacy", "al zahra pharmacy",
+                  "binsina pharmacy", "tabib pharmacy"]},
+    {"id": "health-gym-001", "category": "Health & Wellness", "subcategory": "Gym & Fitness",
+     "patterns": ["fitness first", "golds gym", "ufc gym", "snap fitness", "anytime fitness",
+                  "warehouse gym", "crossfit dubai", "gymnation"]},
+    {"id": "health-salon-001", "category": "Health & Wellness", "subcategory": "Salons & Beauty",
+     "patterns": ["sephora", "mac cosmetics", "nail studio", "toni and guy",
+                  "tips and toes", "waxing company"]},
+    {"id": "travel-hotels-001", "category": "Travel", "subcategory": "Hotels",
+     "patterns": ["marriott", "hilton hotel", "hyatt hotel", "intercontinental",
+                  "radisson", "rotana hotel", "address hotel", "jumeirah hotel",
+                  "sofitel", "ibis hotel", "novotel", "ritz carlton",
+                  "booking.com", "airbnb"]},
+    {"id": "travel-airlines-001", "category": "Travel", "subcategory": "Airlines",
+     "patterns": ["emirates airlines", "flydubai", "air arabia", "etihad airways",
+                  "flynas", "indigo airlines", "british airways", "lufthansa",
+                  "qatar airways", "turkish airlines", "jazeera airways"]},
+    {"id": "government-services-001", "category": "Government", "subcategory": "Government Services",
+     "patterns": ["rta dubai", "dubai land department", "amer center", "dnrd",
+                  "gdrfa", "ica uae", "mohre", "municipality fee", "ejari",
+                  "tasheel", "typing center"]},
+    {"id": "government-fines-001", "category": "Government", "subcategory": "Traffic & Fines",
+     "patterns": ["traffic fine", "rta fine", "police fine", "nol recharge",
+                  "darb payment", "parking fine", "saaed fine"]},
+    {"id": "financial-charges-001", "category": "Financial", "subcategory": "Bank Charges & Fees",
+     "patterns": ["bank charge", "service fee", "annual fee", "processing fee",
+                  "late payment fee", "cash advance fee", "card renewal fee"]},
+    {"id": "shopping-trade-001", "category": "Shopping", "subcategory": "Trade Supplies",
+     "patterns": ["besto trading"]},
+]
+
+
+def _load_category_rules() -> list:
+    try:
+        return json.loads(_CATEGORIES_FILE.read_text())
+    except FileNotFoundError:
+        # First run — seed with default rules and persist them
+        _save_category_rules(_DEFAULT_CATEGORY_RULES)
+        return _DEFAULT_CATEGORY_RULES
+    except json.JSONDecodeError:
+        return []
+
+
+def _save_category_rules(rules: list) -> None:
+    _CATEGORIES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _CATEGORIES_FILE.write_text(json.dumps(rules, indent=2))
+
+
+def _all_patterns(rules: list, exclude_id: str = None) -> dict[str, str]:
+    """Return {pattern_lower: "Category > Subcategory"} for all rules except exclude_id."""
+    out = {}
+    for rule in rules:
+        if rule.get("id") == exclude_id:
+            continue
+        label = f"{rule.get('category', '')} > {rule.get('subcategory', '')}".strip(" >")
+        for p in rule.get("patterns", []):
+            out[p.lower().strip()] = label
+    return out
 
 
 def _load_transfer_rules() -> dict:
@@ -83,12 +201,19 @@ def get_transfer_rules(account_name: str):
 
 @app.post("/transfer-rules/{account_name}")
 async def add_transfer_rule(account_name: str, rule: dict):
-    """Append a transfer rule: {keyword: str, other_account: str}."""
-    if not rule.get("keyword") or not rule.get("other_account"):
-        raise HTTPException(status_code=400, detail="keyword and other_account are required")
+    """Append a rule: {keyword, other_account} for transfer or {keyword, action:"skip"} to drop."""
+    if not rule.get("keyword"):
+        raise HTTPException(status_code=400, detail="keyword is required")
+    is_skip = rule.get("action") == "skip"
+    if not is_skip and not rule.get("other_account"):
+        raise HTTPException(status_code=400, detail="other_account is required for transfer rules")
     rules = _load_transfer_rules()
-    account_rules = rules.setdefault(account_name, [])
-    account_rules.append({"keyword": rule["keyword"], "other_account": rule["other_account"]})
+    entry: dict = {"keyword": rule["keyword"]}
+    if is_skip:
+        entry["action"] = "skip"
+    else:
+        entry["other_account"] = rule["other_account"]
+    rules.setdefault(account_name, []).append(entry)
     _save_transfer_rules(rules)
     return {"success": True}
 
@@ -103,6 +228,122 @@ def delete_transfer_rule(account_name: str, rule_index: int):
         rules[account_name] = account_rules
         _save_transfer_rules(rules)
     return {"success": True}
+
+
+# ── Category-rule CRUD ────────────────────────────────────────────────────────
+
+@app.get("/category-rules")
+def list_category_rules():
+    return {"rules": _load_category_rules()}
+
+
+@app.post("/category-rules")
+async def create_category_rule(rule: dict):
+    category = (rule.get("category") or "").strip()
+    subcategory = (rule.get("subcategory") or "").strip()
+    patterns = [p.strip().lower() for p in rule.get("patterns", []) if p.strip()]
+    if not category:
+        raise HTTPException(status_code=400, detail="category is required")
+    if not patterns:
+        raise HTTPException(status_code=400, detail="at least one pattern is required")
+
+    existing = _load_category_rules()
+    taken = _all_patterns(existing)
+    conflicts = [{"pattern": p, "rule": taken[p]} for p in patterns if p in taken]
+    if conflicts:
+        raise HTTPException(status_code=409, detail={"conflicts": conflicts})
+
+    new_rule = {
+        "id": str(uuid.uuid4()),
+        "category": category,
+        "subcategory": subcategory,
+        "patterns": patterns,
+    }
+    existing.append(new_rule)
+    _save_category_rules(existing)
+    return {"success": True, "rule": new_rule}
+
+
+@app.patch("/category-rules/{rule_id}")
+async def update_category_rule(rule_id: str, body: dict):
+    """Rename category/subcategory of an existing rule (does not touch patterns)."""
+    rules = _load_category_rules()
+    for rule in rules:
+        if rule.get("id") == rule_id:
+            if "category" in body:
+                rule["category"] = body["category"].strip()
+            if "subcategory" in body:
+                rule["subcategory"] = body["subcategory"].strip()
+            break
+    else:
+        raise HTTPException(status_code=404, detail="rule not found")
+    _save_category_rules(rules)
+    return {"success": True}
+
+
+@app.delete("/category-rules/{rule_id}")
+def delete_category_rule(rule_id: str):
+    rules = _load_category_rules()
+    rules = [r for r in rules if r.get("id") != rule_id]
+    _save_category_rules(rules)
+    return {"success": True}
+
+
+@app.post("/category-rules/{rule_id}/patterns")
+async def add_pattern(rule_id: str, body: dict):
+    pattern = (body.get("pattern") or "").strip().lower()
+    if not pattern:
+        raise HTTPException(status_code=400, detail="pattern is required")
+
+    rules = _load_category_rules()
+    taken = _all_patterns(rules, exclude_id=rule_id)
+    if pattern in taken:
+        raise HTTPException(
+            status_code=409,
+            detail={"conflicts": [{"pattern": pattern, "rule": taken[pattern]}]},
+        )
+
+    for rule in rules:
+        if rule.get("id") == rule_id:
+            if pattern not in [p.lower() for p in rule.get("patterns", [])]:
+                rule.setdefault("patterns", []).append(pattern)
+            break
+    else:
+        raise HTTPException(status_code=404, detail="rule not found")
+
+    _save_category_rules(rules)
+    return {"success": True}
+
+
+@app.delete("/category-rules/{rule_id}/patterns/{pattern_index}")
+def delete_pattern(rule_id: str, pattern_index: int):
+    rules = _load_category_rules()
+    for rule in rules:
+        if rule.get("id") == rule_id:
+            patterns = rule.get("patterns", [])
+            if 0 <= pattern_index < len(patterns):
+                patterns.pop(pattern_index)
+            break
+    _save_category_rules(rules)
+    return {"success": True}
+
+
+@app.post("/category-rules/apply")
+async def apply_category_rules():
+    from firefly_client import apply_category_rules_to_transactions
+    rules = _load_category_rules()
+    result = apply_category_rules_to_transactions(rules)
+    return result
+
+
+@app.post("/category-rules/seed")
+async def seed_category_rules(body: dict):
+    """Replace all category rules with the provided seed list (for initial setup)."""
+    rules = body.get("rules", [])
+    if not isinstance(rules, list):
+        raise HTTPException(status_code=400, detail="rules must be a list")
+    _save_category_rules(rules)
+    return {"success": True, "count": len(rules)}
 
 
 @app.post("/parse")
@@ -172,6 +413,19 @@ async def parse_statement(
             os.unlink(tmp_path)
         except OSError:
             pass
+
+
+@app.get("/rules/effective")
+def get_rules_effective():
+    """Return all active transfer rules (user-defined + built-in) tagged with origin."""
+    return {"rules": get_effective_transfer_rules()}
+
+
+@app.post("/rules/apply")
+async def apply_rules():
+    """Retroactively apply transfer rules to all existing Firefly transactions."""
+    result = apply_rules_to_existing_transactions()
+    return result
 
 
 @app.post("/import")
