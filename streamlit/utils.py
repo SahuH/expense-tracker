@@ -49,6 +49,30 @@ def apply_theme():
         [data-testid="stSidebarNavSeparator"] {
             display: none !important;
         }
+
+        /* ── Selectbox / multiselect dropdown: visible options ───────────── */
+        [data-baseweb="popover"] [data-baseweb="menu"] {
+            background-color: #1E2130 !important;
+            border: 1px solid rgba(129,140,248,0.25) !important;
+            border-radius: 8px !important;
+        }
+
+        [data-baseweb="popover"] li {
+            background-color: #1E2130 !important;
+            color: #F3F4F6 !important;
+        }
+
+        [data-baseweb="popover"] li:hover,
+        [data-baseweb="popover"] li[aria-selected="true"] {
+            background-color: #2D3155 !important;
+            color: #FFFFFF !important;
+        }
+
+        /* ── Selectbox input box itself ──────────────────────────────────── */
+        [data-baseweb="select"] > div:first-child {
+            background-color: #1A1B2E !important;
+            border-color: rgba(129,140,248,0.35) !important;
+        }
         </style>
         """,
         unsafe_allow_html=True,

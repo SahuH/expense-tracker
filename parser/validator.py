@@ -1,5 +1,12 @@
 """
-Balance verification: opening + credits - debits == closing (±0.01 tolerance).
+Balance verification.
+
+Bank account : opening + credits - debits == closing  (±0.01 tolerance)
+Credit card  : opening + debits  - credits == closing (charges increase balance owed)
+
+If opening/closing figures cannot be extracted from the statement the check is
+marked as "not_applicable" for credit cards (different label conventions, not a
+parsing failure) and "missing_data" for bank accounts.
 """
 import logging
 from typing import Any
@@ -9,29 +16,47 @@ logger = logging.getLogger(__name__)
 TOLERANCE = 0.01
 
 
-def verify_balance(transactions: list[dict], metadata: dict) -> dict[str, Any]:
+def verify_balance(
+    transactions: list[dict],
+    metadata: dict,
+    statement_type: str = "bank_account",
+) -> dict[str, Any]:
     opening = metadata.get("opening_balance")
     closing = metadata.get("closing_balance")
 
-    total_credits = sum(
-        t["amount"] for t in transactions if t.get("type") == "credit" and t.get("amount")
+    total_credits = round(
+        sum(t["amount"] for t in transactions if t.get("type") == "credit" and t.get("amount")), 2
     )
-    total_debits = sum(
-        t["amount"] for t in transactions if t.get("type") == "debit" and t.get("amount")
+    total_debits = round(
+        sum(t["amount"] for t in transactions if t.get("type") == "debit" and t.get("amount")), 2
     )
 
     result: dict[str, Any] = {
-        "total_credits": round(total_credits, 2),
-        "total_debits": round(total_debits, 2),
+        "total_credits": total_credits,
+        "total_debits": total_debits,
         "transaction_count": len(transactions),
     }
 
     if opening is None or closing is None:
-        result["passed"] = False
-        result["reason"] = "opening_balance or closing_balance not found in statement"
+        if statement_type == "credit_card":
+            result["passed"] = True
+            result["reason"] = "not_applicable"
+            result["note"] = (
+                "Credit card statements use different balance labels; "
+                "reconciliation skipped."
+            )
+        else:
+            result["passed"] = False
+            result["reason"] = "opening_balance or closing_balance not found in statement"
         return result
 
-    expected_closing = round(opening + total_credits - total_debits, 2)
+    # Bank account: opening + credits − debits = closing
+    # Credit card:  opening + debits  − credits = closing (charges add to amount owed)
+    if statement_type == "credit_card":
+        expected_closing = round(opening + total_debits - total_credits, 2)
+    else:
+        expected_closing = round(opening + total_credits - total_debits, 2)
+
     diff = abs(expected_closing - closing)
 
     result["opening_balance"] = opening

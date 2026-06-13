@@ -19,6 +19,7 @@ app = FastAPI(title="PDF Parser Service", version="1.0.0")
 # The file contains plaintext passwords — acceptable for a self-hosted household app
 # on a private server where the operator already has full disk access.
 _PASSWORDS_FILE = Path(os.getenv("PASSWORDS_FILE", "/data/passwords.json"))
+_TRANSFER_RULES_FILE = Path(os.getenv("TRANSFER_RULES_FILE", "/data/transfer_rules.json"))
 
 
 def _load_passwords() -> dict:
@@ -42,6 +43,18 @@ def _delete_password(account_name: str) -> None:
         _PASSWORDS_FILE.write_text(json.dumps(passwords, indent=2))
 
 
+def _load_transfer_rules() -> dict:
+    try:
+        return json.loads(_TRANSFER_RULES_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_transfer_rules(rules: dict) -> None:
+    _TRANSFER_RULES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _TRANSFER_RULES_FILE.write_text(json.dumps(rules, indent=2))
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -57,6 +70,38 @@ def get_password_status(account_name: str):
 def remove_password(account_name: str):
     """Delete the saved PDF password for an account."""
     _delete_password(account_name)
+    return {"success": True}
+
+
+# ── Transfer-rule endpoints ───────────────────────────────────────────────────
+
+@app.get("/transfer-rules/{account_name}")
+def get_transfer_rules(account_name: str):
+    """Return the keyword-based transfer rules for an account."""
+    return {"rules": _load_transfer_rules().get(account_name, [])}
+
+
+@app.post("/transfer-rules/{account_name}")
+async def add_transfer_rule(account_name: str, rule: dict):
+    """Append a transfer rule: {keyword: str, other_account: str}."""
+    if not rule.get("keyword") or not rule.get("other_account"):
+        raise HTTPException(status_code=400, detail="keyword and other_account are required")
+    rules = _load_transfer_rules()
+    account_rules = rules.setdefault(account_name, [])
+    account_rules.append({"keyword": rule["keyword"], "other_account": rule["other_account"]})
+    _save_transfer_rules(rules)
+    return {"success": True}
+
+
+@app.delete("/transfer-rules/{account_name}/{rule_index}")
+def delete_transfer_rule(account_name: str, rule_index: int):
+    """Remove one transfer rule by index."""
+    rules = _load_transfer_rules()
+    account_rules = rules.get(account_name, [])
+    if 0 <= rule_index < len(account_rules):
+        account_rules.pop(rule_index)
+        rules[account_name] = account_rules
+        _save_transfer_rules(rules)
     return {"success": True}
 
 
@@ -98,17 +143,23 @@ async def parse_statement(
             _save_password(account_name, password)
             logger.info("Saved PDF password for account: %s", account_name)
 
-        verification = verify_balance(result["transactions"], result.get("metadata", {}))
+        verification = verify_balance(
+            result["transactions"],
+            result.get("metadata", {}),
+            statement_type=result.get("statement_type", "bank_account"),
+        )
 
         response = {
             "extraction_method": result["method"],
+            "statement_type": result.get("statement_type", "bank_account"),
             "confidence": result["confidence"],
             "metadata": result.get("metadata", {}),
             "transactions": result["transactions"],
             "balance_check": verification,
         }
 
-        if verification["passed"] and result["confidence"] >= 0.7:
+        balance_confirmed = verification.get("passed") and verification.get("reason") == "ok"
+        if balance_confirmed and result["confidence"] >= 0.7:
             response["status"] = "verified"
         else:
             response["status"] = "needs_review"

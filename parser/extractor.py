@@ -8,6 +8,14 @@ Two strategies:
    with borderless tables and multi-line description cells (e.g. FAB, WIO).
 
 Whichever strategy yields more transactions is used.
+
+Statement profiles
+──────────────────
+bank_account : standard debit/credit columns; minimal description cleaning.
+credit_card  : strips posting-date prefix, trailing "AED [amount]" suffix,
+               (cid:N) font artifacts, and footer/rewards contamination.
+               Column positions are carried forward across pages so type
+               (debit vs credit) stays consistent across a multi-page statement.
 """
 import re
 import logging
@@ -29,6 +37,66 @@ COMBINED_DATE_RE = re.compile("|".join(DATE_PATTERNS))
 # Matches exactly "DD MON YYYY" (3-word date with 3-letter month)
 DATE_3W_RE = re.compile(r"^\d{2}\s+[A-Za-z]{3}\s+\d{4}$")
 
+# ─── Description-cleaning regexes ─────────────────────────────────────────────
+
+# Universal: remove (cid:N) font-encoding artifacts
+_CID_RE = re.compile(r"\(cid:\d+\)")
+
+# Universal: truncate at statement footer / rewards section
+_FOOTER_RE = re.compile(
+    r"(?:See\s+reverse\s+side"
+    r"|(?:FAB\s+Al.Futtaim|Al.Futtaim\s+FAB)\s+Rewards"
+    r"|Rewards\s+(?:Balance|Expiring)"
+    r"|Total\s+\d+\s+FAB)",
+    re.IGNORECASE,
+)
+
+# Credit-card: posting date embedded at start of description (DD-MM-YYYY or DD/MM/YYYY)
+_CC_DATE_PREFIX_RE = re.compile(r"^\d{2}[-/]\d{2}[-/]\d{4}\s+")
+
+# Credit-card: trailing currency code (AED/USD/EUR/…) optionally followed by the
+# original amount, printed inside the description column for foreign transactions.
+_CC_CCY_SUFFIX_RE = re.compile(
+    r"\s+(?:AED|USD|EUR|GBP|CAD|INR|SAR|QAR|KWD|BHD|OMR|SGD|AUD|CHF|JPY)"
+    r"(?:\s+[\d,]+(?:\.\d{1,2})?)?\s*$",
+    re.IGNORECASE,
+)
+
+
+# ─── Statement-type detection ──────────────────────────────────────────────────
+
+_CC_TEXT_SIGNALS = ("credit card statement", "card statement", "credit card account")
+_CC_NAME_SIGNALS = ("credit card", " cc", "cc ", "credit")
+
+
+def _detect_statement_type(full_text: str, account_name: str) -> str:
+    """Return 'credit_card' or 'bank_account' based on PDF content and account name."""
+    tl = full_text.lower()
+    nl = account_name.lower()
+    if any(s in tl for s in _CC_TEXT_SIGNALS):
+        return "credit_card"
+    if any(s in nl for s in _CC_NAME_SIGNALS):
+        return "credit_card"
+    return "bank_account"
+
+
+# ─── Description cleaner ──────────────────────────────────────────────────────
+
+def _clean_description(desc: str, statement_type: str) -> str:
+    if not desc:
+        return desc
+    # Universal: strip (cid:N) artifacts
+    desc = _CID_RE.sub("", desc)
+    # Universal: truncate at footer / rewards block
+    m = _FOOTER_RE.search(desc)
+    if m:
+        desc = desc[: m.start()]
+    # Credit-card specific
+    if statement_type == "credit_card":
+        desc = _CC_DATE_PREFIX_RE.sub("", desc)
+        desc = _CC_CCY_SUFFIX_RE.sub("", desc)
+    return desc.strip()
+
 
 def _parse_amount(raw: str) -> float:
     return float(raw.replace(",", ""))
@@ -44,7 +112,9 @@ def _parse_date(raw: str) -> Optional[str]:
 
 # ─── Strategy 1: table extraction ─────────────────────────────────────────────
 
-def _extract_tables(pdf_path: str, account_name: str, password: str = "") -> tuple:
+def _extract_tables(
+    pdf_path: str, account_name: str, password: str = "", statement_type: str = "bank_account"
+) -> tuple:
     transactions = []
     metadata = {}
     pages_with_tables = 0
@@ -62,14 +132,16 @@ def _extract_tables(pdf_path: str, account_name: str, password: str = "") -> tup
                 for row in table[1:]:
                     if not row or all(c is None or str(c).strip() == "" for c in row):
                         continue
-                    txn = _map_row_to_transaction(header, row, account_name)
+                    txn = _map_row_to_transaction(header, row, account_name, statement_type)
                     if txn:
                         transactions.append(txn)
 
     return transactions, metadata, pages_with_tables
 
 
-def _map_row_to_transaction(header: list, row: list, account_name: str) -> Optional[dict]:
+def _map_row_to_transaction(
+    header: list, row: list, account_name: str, statement_type: str = "bank_account"
+) -> Optional[dict]:
     row_str = [str(c).strip() if c is not None else "" for c in row]
     date_val = description = None
     debit_amount = credit_amount = balance = None
@@ -107,8 +179,16 @@ def _map_row_to_transaction(header: list, row: list, account_name: str) -> Optio
     if date_val is None or (debit_amount is None and credit_amount is None):
         return None
 
+    description = _clean_description(description or "", statement_type)
+    if not description:
+        return None
+
     txn_type = "debit" if debit_amount is not None else "credit"
     amount = debit_amount if debit_amount is not None else credit_amount
+
+    # Sanity: balance_after shouldn't equal the transaction amount (CC layout artifact)
+    if balance is not None and abs(balance - amount) < 0.01:
+        balance = None
 
     return {
         "date": date_val,
@@ -145,7 +225,16 @@ _HEADER_WORDS = set(_COL_ALIASES.keys())
 
 
 def _find_col_positions(lines: list) -> dict:
-    """Return column-name → x0 by locating the header row (must contain debit + credit)."""
+    """
+    Return column-name → x0 by locating the header row.
+
+    Fast path: a single line contains both 'debit' and 'credit'.
+    Fallback:  bilingual / multi-row merged-cell headers (e.g. FAB CC) split
+               'Debit' and 'Credit' across two y-buckets.  Scan all lines for
+               each word individually; if both are found and credit_x > debit_x
+               (right-to-left makes no sense for columns) return combined positions.
+    """
+    # Fast path — single line with both keywords
     for line in lines:
         texts = [w["text"].lower() for w in line]
         has_debit = any(t in ("debit", "withdrawal") for t in texts)
@@ -157,6 +246,26 @@ def _find_col_positions(lines: list) -> dict:
                 if canonical:
                     cols.setdefault(canonical, w["x0"])
             return cols
+
+    # Fallback — keywords split across lines (multi-row merged-cell header)
+    debit_w = credit_w = None
+    for line in lines:
+        for w in line:
+            wl = w["text"].lower()
+            if wl in ("debit", "withdrawal") and debit_w is None:
+                debit_w = w
+            elif wl in ("credit", "deposit") and credit_w is None:
+                credit_w = w
+
+    if debit_w and credit_w and credit_w["x0"] > debit_w["x0"]:
+        cols = {"debit": debit_w["x0"], "credit": credit_w["x0"]}
+        for line in lines:
+            for w in line:
+                canonical = _COL_ALIASES.get(w["text"].lower())
+                if canonical and canonical not in cols:
+                    cols[canonical] = w["x0"]
+        return cols
+
     return {}
 
 
@@ -176,6 +285,20 @@ def _assign_col(x: float, debit_x, credit_x, balance_x) -> Optional[str]:
 _SKIP_PHRASES = {
     "opening balance", "closing balance", "closing statement",
     "statement balance", "brought forward", "carried forward",
+}
+
+# These phrases mark the start of a page footer / rewards section.
+# When detected, the current transaction is finalised and collection stops —
+# this prevents footer numbers (e.g. rewards totals) from being absorbed as
+# transaction amounts.
+_PAGE_FOOTER_PHRASES = {
+    "rewards balance",
+    "rewards expiring",
+    "al-futtaim fab rewards",
+    "futtaim fab rewards",
+    "for more information on your fab",
+    "see reverse side",
+    "important information",
 }
 
 
@@ -208,14 +331,21 @@ def _col_amount(words: list, x_left: float, x_right: float = None) -> Optional[f
     return _parse_amount(matches[-1])            # rightmost = actual right-aligned amount
 
 
-def _extract_text_based(pdf_path: str, account_name: str, password: str = "") -> tuple:
+def _extract_text_based(
+    pdf_path: str, account_name: str, password: str = "", statement_type: str = "bank_account"
+) -> tuple:
     """
     Word-position extraction for borderless-table bank statements.
     Groups display lines into transaction rows by detecting dates at the left margin,
     then separates description text from financial amounts by column x-position.
+
+    Column positions detected on each page are carried forward to subsequent pages
+    so that multi-page statements with headers only on page 1 stay consistent.
     """
     transactions: list = []
     metadata: dict = {}
+    # Carry the last-known column layout across pages (critical for multi-page CC statements)
+    last_known_col_pos: dict = {}
 
     with pdfplumber.open(pdf_path, password=password) as pdf:
         for page in pdf.pages:
@@ -224,7 +354,13 @@ def _extract_text_based(pdf_path: str, account_name: str, password: str = "") ->
                 continue
 
             lines = _words_to_lines(words)
-            col_pos = _find_col_positions(lines)
+
+            # Update column layout only when the current page has a header row
+            page_col_pos = _find_col_positions(lines)
+            if page_col_pos:
+                last_known_col_pos = page_col_pos
+            col_pos = last_known_col_pos
+
             page_width = page.width
 
             # Amount columns start at the debit column (fall back to 65% of page)
@@ -243,6 +379,15 @@ def _extract_text_based(pdf_path: str, account_name: str, password: str = "") ->
                     continue
 
                 line_text_lower = " ".join(w["text"] for w in line).lower()
+
+                # Footer section boundary — commit current transaction and stop collecting.
+                # This prevents footer numbers (rewards totals, etc.) from being absorbed
+                # as amount words for the last transaction on the page.
+                if any(p in line_text_lower for p in _PAGE_FOOTER_PHRASES):
+                    if current:
+                        rows.append(current)
+                        current = None
+                    continue
 
                 # Skip summary and header lines
                 if any(p in line_text_lower for p in _SKIP_PHRASES):
@@ -274,17 +419,26 @@ def _extract_text_based(pdf_path: str, account_name: str, password: str = "") ->
             if current:
                 rows.append(current)
 
-            logger.info("Page text-layout: detected %d transaction rows (col_pos=%s)", len(rows), col_pos)
+            logger.info(
+                "Page text-layout: detected %d transaction rows (col_pos=%s)",
+                len(rows), col_pos,
+            )
 
             for row in rows:
-                txn = _parse_text_row(row, account_name, col_pos, amount_x_min)
+                txn = _parse_text_row(row, account_name, col_pos, amount_x_min, statement_type)
                 if txn:
                     transactions.append(txn)
 
     return transactions, metadata
 
 
-def _parse_text_row(row: dict, account_name: str, col_pos: dict, amount_x_min: float) -> Optional[dict]:
+def _parse_text_row(
+    row: dict,
+    account_name: str,
+    col_pos: dict,
+    amount_x_min: float,
+    statement_type: str = "bank_account",
+) -> Optional[dict]:
     first_line = row["lines"][0]
     date_val = row["date"]
     idx = row.get("date_end_idx", 3)
@@ -307,7 +461,7 @@ def _parse_text_row(row: dict, account_name: str, col_pos: dict, amount_x_min: f
         key=lambda w: w["x0"],
     )
 
-    description = " ".join(desc_parts).strip()
+    description = _clean_description(" ".join(desc_parts).strip(), statement_type)
     if not description:
         return None
 
@@ -329,7 +483,9 @@ def _parse_text_row(row: dict, account_name: str, col_pos: dict, amount_x_min: f
         credit = _col_amount(amount_words, credit_x, balance_x)
         balance = _col_amount(amount_words, balance_x) if balance_x is not None else None
     else:
-        # No column info: last amount = balance, penultimate = transaction (default credit)
+        # No column info: position-based heuristic.
+        # CC statements: all purchases are debits (they increase the balance owed).
+        # Bank accounts: single-amount lines are assumed credits (default historical behaviour).
         debit = credit = balance = None
         vals = []
         for w in amount_words:
@@ -337,17 +493,31 @@ def _parse_text_row(row: dict, account_name: str, col_pos: dict, amount_x_min: f
                 vals.append(float(w["text"].replace(",", "")))
             except ValueError:
                 pass
+        cc = statement_type == "credit_card"
         if len(vals) == 1:
-            credit = vals[0]
+            if cc:
+                debit = vals[0]
+            else:
+                credit = vals[0]
         elif len(vals) >= 2:
-            balance = vals[-1]
-            credit = vals[-2]
+            if cc:
+                # Rightmost amount = AED Debit column; any preceding amounts are
+                # original-currency figures from the "Original CCY Amount" column.
+                # Don't guess balance without confirmed column positions for CC.
+                debit = vals[-1]
+            else:
+                balance = vals[-1]
+                credit = vals[-2]
 
     if debit is None and credit is None:
         return None
 
     txn_type = "debit" if debit is not None else "credit"
     amount = debit if debit is not None else credit
+
+    # Sanity: balance_after shouldn't equal the transaction amount (CC layout artifact)
+    if balance is not None and abs(balance - amount) < 0.01:
+        balance = None
 
     return {
         "date": date_val,
@@ -364,17 +534,31 @@ def _parse_text_row(row: dict, account_name: str, col_pos: dict, amount_x_min: f
 
 def _extract_metadata_from_text(text: str) -> dict:
     meta = {}
-    ob = re.search(r"opening\s+balance[:\s]+([\d,]+\.\d{2})", text, re.IGNORECASE)
+
+    # ── Opening / previous balance ────────────────────────────────────────────
+    ob = re.search(
+        r"(?:opening|previous|prior)\s+(?:statement\s+)?balance[:\s]+([\d,]+\.\d{2})",
+        text, re.IGNORECASE,
+    )
     if ob:
         meta["opening_balance"] = float(ob.group(1).replace(",", ""))
+
+    # ── Closing / new / current balance ──────────────────────────────────────
     cb = re.search(
-        r"closing\s+(?:statement\s+)?balance[:\s]+([\d,]+\.\d{2})",
+        r"(?:closing|new|current)\s+(?:statement\s+)?balance[:\s]+([\d,]+\.\d{2})",
         text, re.IGNORECASE,
     )
     if not cb:
         cb = re.search(r"closing\s+balance\s*\n[^0-9]*([\d,]+\.\d{2})", text, re.IGNORECASE)
+    # Credit card: "Total Amount Due" or "Statement Balance" as closing figure
+    if not cb:
+        cb = re.search(
+            r"(?:total\s+amount\s+due|statement\s+balance)[:\s]+([\d,]+\.\d{2})",
+            text, re.IGNORECASE,
+        )
     if cb:
         meta["closing_balance"] = float(cb.group(1).replace(",", ""))
+
     return meta
 
 
@@ -382,10 +566,15 @@ def _extract_metadata_from_text(text: str) -> dict:
 
 def extract_with_pdfplumber(pdf_path: str, account_name: str, password: str = "") -> dict:
     try:
-        table_txns, table_meta, pages_with_tables = _extract_tables(pdf_path, account_name, password)
-
         with pdfplumber.open(pdf_path, password=password) as pdf:
             full_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+
+        statement_type = _detect_statement_type(full_text, account_name)
+        logger.info("Detected statement type: %s for account: %s", statement_type, account_name)
+
+        table_txns, table_meta, pages_with_tables = _extract_tables(
+            pdf_path, account_name, password, statement_type
+        )
 
         table_meta.update(_extract_metadata_from_text(full_text))
 
@@ -397,7 +586,9 @@ def extract_with_pdfplumber(pdf_path: str, account_name: str, password: str = ""
             valid = sum(1 for t in table_txns if t.get("date") and t.get("amount") and t.get("description"))
             table_conf = min(0.95, valid / len(table_txns))
 
-        text_txns, text_meta = _extract_text_based(pdf_path, account_name, password)
+        text_txns, text_meta = _extract_text_based(
+            pdf_path, account_name, password, statement_type
+        )
 
         logger.info(
             "Extraction results — table: %d txns (conf=%.2f), text-layout: %d txns",
@@ -424,6 +615,7 @@ def extract_with_pdfplumber(pdf_path: str, account_name: str, password: str = ""
             "metadata": metadata,
             "confidence": confidence,
             "method": method,
+            "statement_type": statement_type,
         }
 
     except PDFPasswordIncorrect:

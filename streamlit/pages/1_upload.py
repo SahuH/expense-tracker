@@ -86,6 +86,63 @@ else:
         key="pdf_password",
     )
 
+# ── Transfer rules ────────────────────────────────────────────────────────────
+with st.expander("⚙️ Transfer rules for this account", expanded=False):
+    st.caption(
+        "Define keyword patterns that mark a transaction as an internal transfer. "
+        "Example: when FAB Credit Card sees 'PAYMENT RECEIVED', treat it as a transfer "
+        "from your bank account — no Firefly rules needed."
+    )
+    try:
+        _tr_resp = requests.get(
+            f"{PARSER_URL}/transfer-rules/{quote(selected_account, safe='')}",
+            timeout=5,
+        )
+        _existing_rules = _tr_resp.json().get("rules", []) if _tr_resp.ok else []
+    except Exception:
+        _existing_rules = []
+
+    if _existing_rules:
+        st.markdown("**Saved rules:**")
+        for _i, _rule in enumerate(_existing_rules):
+            _rc1, _rc2 = st.columns([6, 1])
+            _rc1.markdown(
+                f"Description contains **\"{_rule['keyword']}\"** → transfer with **{_rule['other_account']}**"
+            )
+            if _rc2.button("Delete", key=f"del_rule_{_i}"):
+                try:
+                    requests.delete(
+                        f"{PARSER_URL}/transfer-rules/{quote(selected_account, safe='')}/{_i}",
+                        timeout=5,
+                    )
+                    st.rerun()
+                except Exception as _e:
+                    st.warning(f"Could not delete rule: {_e}")
+    else:
+        st.caption("No rules yet for this account.")
+
+    st.markdown("**Add a rule:**")
+    _ra1, _ra2 = st.columns([3, 4])
+    _new_keyword = _ra1.text_input(
+        "Description keyword", placeholder="e.g. PAYMENT RECEIVED", key="new_rule_kw"
+    )
+    _acct_opts = [a for a in account_options.keys() if a != selected_account]
+    _other_acct = _ra2.selectbox("Transfer to/from account", _acct_opts, key="new_rule_acct")
+    if st.button("Add rule", key="add_rule_btn"):
+        if _new_keyword:
+            try:
+                requests.post(
+                    f"{PARSER_URL}/transfer-rules/{quote(selected_account, safe='')}",
+                    json={"keyword": _new_keyword, "other_account": _other_acct},
+                    timeout=5,
+                )
+                st.success(f"Rule added: \"{_new_keyword}\" → {_other_acct}")
+                st.rerun()
+            except Exception as _e:
+                st.warning(f"Could not add rule: {_e}")
+        else:
+            st.warning("Enter a keyword first.")
+
 # ── 2. File uploader ──────────────────────────────────────────────────────────
 st.subheader("2. Upload statement")
 uploaded_file = st.file_uploader("Choose a PDF or CSV file", type=["pdf", "csv"])
@@ -226,16 +283,19 @@ if "parse_result" in st.session_state:
     status = result.get("status", "unknown")
 
     st.subheader("3. Verification")
-    v1, v2, v3 = st.columns(3)
+    v1, v2, v3, v4 = st.columns(4)
     v1.metric("Transactions found", len(transactions))
     v2.metric("Method", result.get("extraction_method", "—"))
+    v3.metric("Statement type", result.get("statement_type", "—").replace("_", " ").title())
 
-    if balance_check.get("passed"):
-        v3.success("✅ Balance check passed")
+    if balance_check.get("passed") and balance_check.get("reason") == "not_applicable":
+        v4.info("ℹ️ Credit card — balance check skipped")
+    elif balance_check.get("passed"):
+        v4.success("✅ Balance check passed")
     elif result.get("extraction_method") == "csv":
-        v3.info("ℹ️ CSV — balance check skipped")
+        v4.info("ℹ️ CSV — balance check skipped")
     else:
-        v3.error(f"⚠️ Balance check failed: {balance_check.get('reason', '')}")
+        v4.error(f"⚠️ Balance check failed: {balance_check.get('reason', '')}")
 
     if balance_check and result.get("extraction_method") != "csv":
         with st.expander("Balance details"):
@@ -280,14 +340,20 @@ if "parse_result" in st.session_state:
     st.subheader("5. Import to Firefly")
     imp_col, _ = st.columns([2, 6])
     if imp_col.button("Import to Firefly", type="primary", use_container_width=True, disabled=len(final_transactions) == 0):
-        for txn in final_transactions:
+        import math
+        # Pandas represents empty cells as float NaN after to_dict(); JSON rejects NaN.
+        clean_transactions = [
+            {k: (None if isinstance(v, float) and math.isnan(v) else v) for k, v in txn.items()}
+            for txn in final_transactions
+        ]
+        for txn in clean_transactions:
             if not txn.get("account_name"):
                 txn["account_name"] = selected_account
         with st.spinner("Pushing to Firefly III…"):
             try:
                 import_resp = requests.post(
                     f"{PARSER_URL}/import",
-                    json={"transactions": final_transactions},
+                    json={"transactions": clean_transactions},
                     timeout=120,
                 )
                 import_resp.raise_for_status()
