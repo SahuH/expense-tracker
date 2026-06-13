@@ -6,6 +6,7 @@ from collections import defaultdict
 from auth import require_login
 from sidebar import render_sidebar
 from utils import apply_theme
+from firefly_api import get_accounts
 
 st.set_page_config(
     page_title="Categories — Household Finance",
@@ -48,6 +49,15 @@ def _conflict_msg(detail) -> str:
             return "Pattern conflict:\n" + "\n".join(f"- {l}" for l in lines)
     return str(detail)
 
+
+# ── Load accounts for the account-scope dropdown ─────────────────────────────
+try:
+    _raw_accounts = get_accounts()
+    _account_names = [a["attributes"]["name"] for a in _raw_accounts]
+except Exception:
+    _account_names = []
+
+_ACCOUNT_OPTIONS = ["All accounts (global)"] + _account_names
 
 # ── Load rules ────────────────────────────────────────────────────────────────
 rules = _fetch_rules()
@@ -99,30 +109,49 @@ st.markdown("---")
 # ── Add new rule ──────────────────────────────────────────────────────────────
 with st.expander("+ Add new rule", expanded=not rules):
     existing_cats = sorted(grouped.keys())
-    cat_choice = st.selectbox(
-        "Top-level category",
-        ["— type below to create new —"] + existing_cats,
-        key="new_rule_cat_sel",
-    )
-    new_cat = st.text_input(
-        "Category name (leave blank to use selection above)",
-        key="new_rule_cat_txt",
-        placeholder="e.g. Food & Dining",
-    )
-    new_subcat = st.text_input(
-        "Subcategory (optional)",
-        key="new_rule_subcat",
-        placeholder="e.g. Restaurants",
-    )
-    new_pattern = st.text_input(
-        "Initial pattern (contains, case-insensitive)",
-        key="new_rule_pattern",
-        placeholder="e.g. carrefour",
-    )
+    fc1, fc2 = st.columns(2)
+    with fc1:
+        cat_choice = st.selectbox(
+            "Top-level category",
+            ["— type below to create new —"] + existing_cats,
+            key="new_rule_cat_sel",
+        )
+        new_cat = st.text_input(
+            "Category name (leave blank to use selection above)",
+            key="new_rule_cat_txt",
+            placeholder="e.g. Food & Dining",
+        )
+        new_subcat = st.text_input(
+            "Subcategory (optional)",
+            key="new_rule_subcat",
+            placeholder="e.g. Restaurants",
+        )
+    with fc2:
+        acct_choice = st.selectbox(
+            "Account scope",
+            _ACCOUNT_OPTIONS,
+            key="new_rule_account",
+            help=(
+                "**All accounts (global)** — rule applies to any account.\n\n"
+                "**Specific account** — rule only fires when the transaction is "
+                "from/to that account. Account-specific rules take priority over global ones, "
+                "so the same pattern can be reused for a different category on a different account."
+            ),
+        )
+        new_pattern = st.text_input(
+            "Initial pattern (contains, case-insensitive)",
+            key="new_rule_pattern",
+            placeholder="e.g. careem deliveries",
+        )
+        st.caption(
+            "The same pattern can appear in two rules if they target different accounts. "
+            "Within the same scope (global or same account) patterns must be unique."
+        )
 
     if st.button("Save rule", type="primary"):
         category = (new_cat.strip() or
                     (cat_choice if cat_choice != "— type below to create new —" else ""))
+        account = None if acct_choice == "All accounts (global)" else acct_choice
         if not category:
             st.error("Category name is required.")
         elif not new_pattern.strip():
@@ -134,12 +163,14 @@ with st.expander("+ Add new rule", expanded=not rules):
                     json={
                         "category": category,
                         "subcategory": new_subcat.strip(),
+                        "account": account,
                         "patterns": [new_pattern.strip().lower()],
                     },
                     timeout=10,
                 )
                 if resp.ok:
-                    st.success(f"Rule added: **{category}** › **{new_subcat or '—'}**")
+                    scope = f" [{account}]" if account else ""
+                    st.success(f"Rule added: **{category}** › **{new_subcat or '—'}**{scope}")
                     st.rerun()
                 elif resp.status_code == 409:
                     st.error(_conflict_msg(resp.json().get("detail")))
@@ -162,10 +193,17 @@ for top_cat, cat_rules in sorted(grouped.items()):
         for rule in cat_rules:
             rule_id = rule["id"]
             subcat = rule.get("subcategory") or "—"
+            rule_account = rule.get("account") or None
             patterns = rule.get("patterns", [])
 
             rc1, rc2 = st.columns([5, 1])
-            rc1.markdown(f"**{subcat}**")
+            account_badge = (
+                f' &nbsp;<span style="background:rgba(99,110,250,0.18);border:1px solid '
+                f'rgba(99,110,250,0.4);border-radius:4px;padding:1px 7px;font-size:0.75rem;'
+                f'font-weight:500">{rule_account}</span>'
+                if rule_account else ""
+            )
+            rc1.markdown(f"**{subcat}**{account_badge}", unsafe_allow_html=True)
             if rc2.button("Delete rule", key=f"del_rule_{rule_id}", help="Remove this rule and all its patterns"):
                 try:
                     requests.delete(f"{PARSER_URL}/category-rules/{rule_id}", timeout=5)

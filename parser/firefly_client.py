@@ -404,21 +404,29 @@ def apply_category_rules_to_transactions(rules: list) -> dict:
         return {"success": True, "updated_count": 0, "skipped_count": 0,
                 "error_count": 0, "errors": [], "category_counts": {}}
 
-    # Flatten rules into an ordered lookup list [(pattern, category_name)]
-    lookup: list[tuple[str, str]] = []
+    # Flatten rules into an ordered lookup list [(pattern, category_name, account_or_None)]
+    # account=None means the rule is global (matches any account)
+    lookup: list[tuple[str, str, str | None]] = []
     for rule in rules:
         subcat = (rule.get("subcategory") or "").strip()
         cat = (rule.get("category") or "").strip()
         category_name = subcat if subcat else cat
+        rule_account = (rule.get("account") or "").strip().lower() or None
         for p in rule.get("patterns", []):
             p = p.strip().lower()
             if p:
-                lookup.append((p, category_name))
+                lookup.append((p, category_name, rule_account))
 
-    def _match(description: str) -> str | None:
+    def _match(description: str, account_name: str) -> str | None:
         desc_lower = description.lower()
-        for pattern, category in lookup:
-            if pattern in desc_lower:
+        acc_lower = (account_name or "").lower()
+        # Pass 1: account-specific rules take priority
+        for pattern, category, rule_account in lookup:
+            if rule_account and rule_account == acc_lower and pattern in desc_lower:
+                return category
+        # Pass 2: global rules
+        for pattern, category, rule_account in lookup:
+            if not rule_account and pattern in desc_lower:
                 return category
         return None
 
@@ -450,8 +458,12 @@ def apply_category_rules_to_transactions(rules: list) -> dict:
                     continue
                 split = splits[0]
                 description = split.get("description", "")
+                account_name = (
+                    split.get("source_name", "") if txn_type == "withdrawal"
+                    else split.get("destination_name", "")
+                )
 
-                category = _match(description)
+                category = _match(description, account_name)
                 if not category:
                     skipped += 1
                     continue
@@ -469,7 +481,7 @@ def apply_category_rules_to_transactions(rules: list) -> dict:
                         "date": date,
                         "amount": amount,
                         "description": description,
-                        "source_name": split.get("source_name", ""),
+                        "source_name": account_name,
                         "currency_code": currency,
                         "category_name": category,
                     }
@@ -479,7 +491,7 @@ def apply_category_rules_to_transactions(rules: list) -> dict:
                         "date": date,
                         "amount": amount,
                         "description": description,
-                        "destination_name": split.get("destination_name", ""),
+                        "destination_name": account_name,
                         "currency_code": currency,
                         "category_name": category,
                     }

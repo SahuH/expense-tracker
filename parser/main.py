@@ -149,13 +149,34 @@ def _save_category_rules(rules: list) -> None:
     _CATEGORIES_FILE.write_text(json.dumps(rules, indent=2))
 
 
-def _all_patterns(rules: list, exclude_id: str = None) -> dict[str, str]:
-    """Return {pattern_lower: "Category > Subcategory"} for all rules except exclude_id."""
+def _all_patterns(rules: list, exclude_id: str = None, scoped_account: str = None) -> dict[str, str]:
+    """
+    Return {pattern_lower: label} for patterns that would conflict when adding to a rule
+    scoped to `scoped_account` (None = global rule).
+
+    Conflict rules:
+      global vs global          → conflict  (same pattern, both unscoped)
+      account-A vs account-A    → conflict  (same pattern, same account)
+      global vs account-specific → no conflict (account-specific overrides global)
+      account-A vs account-B    → no conflict  (different accounts, both exclusive)
+    """
+    norm = lambda s: (s or "").strip().lower() or None
+    scoped = norm(scoped_account)
     out = {}
     for rule in rules:
         if rule.get("id") == exclude_id:
             continue
+        rule_acc = norm(rule.get("account"))
+        # Only include rules that are in the same "scope bucket"
+        if scoped is None and rule_acc is not None:
+            continue  # global vs account-specific → no conflict
+        if scoped is not None and rule_acc is None:
+            continue  # account-specific vs global → no conflict
+        if scoped is not None and rule_acc is not None and rule_acc != scoped:
+            continue  # different accounts → no conflict
         label = f"{rule.get('category', '')} > {rule.get('subcategory', '')}".strip(" >")
+        if rule_acc:
+            label += f" [{rule.get('account')}]"
         for p in rule.get("patterns", []):
             out[p.lower().strip()] = label
     return out
@@ -241,6 +262,7 @@ def list_category_rules():
 async def create_category_rule(rule: dict):
     category = (rule.get("category") or "").strip()
     subcategory = (rule.get("subcategory") or "").strip()
+    account = (rule.get("account") or "").strip() or None
     patterns = [p.strip().lower() for p in rule.get("patterns", []) if p.strip()]
     if not category:
         raise HTTPException(status_code=400, detail="category is required")
@@ -248,7 +270,7 @@ async def create_category_rule(rule: dict):
         raise HTTPException(status_code=400, detail="at least one pattern is required")
 
     existing = _load_category_rules()
-    taken = _all_patterns(existing)
+    taken = _all_patterns(existing, scoped_account=account)
     conflicts = [{"pattern": p, "rule": taken[p]} for p in patterns if p in taken]
     if conflicts:
         raise HTTPException(status_code=409, detail={"conflicts": conflicts})
@@ -259,6 +281,8 @@ async def create_category_rule(rule: dict):
         "subcategory": subcategory,
         "patterns": patterns,
     }
+    if account:
+        new_rule["account"] = account
     existing.append(new_rule)
     _save_category_rules(existing)
     return {"success": True, "rule": new_rule}
@@ -266,7 +290,7 @@ async def create_category_rule(rule: dict):
 
 @app.patch("/category-rules/{rule_id}")
 async def update_category_rule(rule_id: str, body: dict):
-    """Rename category/subcategory of an existing rule (does not touch patterns)."""
+    """Rename category/subcategory/account of an existing rule (does not touch patterns)."""
     rules = _load_category_rules()
     for rule in rules:
         if rule.get("id") == rule_id:
@@ -274,6 +298,12 @@ async def update_category_rule(rule_id: str, body: dict):
                 rule["category"] = body["category"].strip()
             if "subcategory" in body:
                 rule["subcategory"] = body["subcategory"].strip()
+            if "account" in body:
+                acc = (body["account"] or "").strip() or None
+                if acc:
+                    rule["account"] = acc
+                else:
+                    rule.pop("account", None)
             break
     else:
         raise HTTPException(status_code=404, detail="rule not found")
@@ -296,20 +326,21 @@ async def add_pattern(rule_id: str, body: dict):
         raise HTTPException(status_code=400, detail="pattern is required")
 
     rules = _load_category_rules()
-    taken = _all_patterns(rules, exclude_id=rule_id)
+    # Find the rule's own account so conflict check uses the right scope
+    target = next((r for r in rules if r.get("id") == rule_id), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="rule not found")
+    rule_account = (target.get("account") or "").strip() or None
+
+    taken = _all_patterns(rules, exclude_id=rule_id, scoped_account=rule_account)
     if pattern in taken:
         raise HTTPException(
             status_code=409,
             detail={"conflicts": [{"pattern": pattern, "rule": taken[pattern]}]},
         )
 
-    for rule in rules:
-        if rule.get("id") == rule_id:
-            if pattern not in [p.lower() for p in rule.get("patterns", [])]:
-                rule.setdefault("patterns", []).append(pattern)
-            break
-    else:
-        raise HTTPException(status_code=404, detail="rule not found")
+    if pattern not in [p.lower() for p in target.get("patterns", [])]:
+        target.setdefault("patterns", []).append(pattern)
 
     _save_category_rules(rules)
     return {"success": True}
