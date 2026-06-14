@@ -138,6 +138,11 @@ with st.expander("+ Add new rule", expanded=not rules):
                 "so the same pattern can be reused for a different category on a different account."
             ),
         )
+        txn_type_choice = st.selectbox(
+            "Transaction type",
+            ["Both (Expense & Income)", "Expense only", "Income only"],
+            key="new_rule_txn_type",
+        )
         new_pattern = st.text_input(
             "Initial pattern (contains, case-insensitive)",
             key="new_rule_pattern",
@@ -152,6 +157,12 @@ with st.expander("+ Add new rule", expanded=not rules):
         category = (new_cat.strip() or
                     (cat_choice if cat_choice != "— type below to create new —" else ""))
         account = None if acct_choice == "All accounts (global)" else acct_choice
+        _txn_type_map = {
+            "Both (Expense & Income)": None,
+            "Expense only": "withdrawal",
+            "Income only": "deposit",
+        }
+        txn_type = _txn_type_map.get(txn_type_choice)
         if not category:
             st.error("Category name is required.")
         elif not new_pattern.strip():
@@ -164,6 +175,7 @@ with st.expander("+ Add new rule", expanded=not rules):
                         "category": category,
                         "subcategory": new_subcat.strip(),
                         "account": account,
+                        "transaction_type": txn_type,
                         "patterns": [new_pattern.strip().lower()],
                     },
                     timeout=10,
@@ -203,7 +215,16 @@ for top_cat, cat_rules in sorted(grouped.items()):
                 f'font-weight:500">{rule_account}</span>'
                 if rule_account else ""
             )
-            rc1.markdown(f"**{subcat}**{account_badge}", unsafe_allow_html=True)
+            _txn_type_label = {"withdrawal": "Expense", "deposit": "Income"}.get(
+                rule.get("transaction_type") or ""
+            )
+            txn_type_badge = (
+                f' &nbsp;<span style="background:rgba(250,180,50,0.15);border:1px solid '
+                f'rgba(250,180,50,0.4);border-radius:4px;padding:1px 7px;font-size:0.75rem;'
+                f'font-weight:500">{_txn_type_label}</span>'
+                if _txn_type_label else ""
+            )
+            rc1.markdown(f"**{subcat}**{account_badge}{txn_type_badge}", unsafe_allow_html=True)
             if rc2.button("Delete rule", key=f"del_rule_{rule_id}", help="Remove this rule and all its patterns"):
                 try:
                     requests.delete(f"{PARSER_URL}/category-rules/{rule_id}", timeout=5)

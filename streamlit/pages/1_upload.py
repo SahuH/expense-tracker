@@ -386,12 +386,10 @@ if "parse_result" in st.session_state:
         "description":  st.column_config.TextColumn("Description",  width="large"),
         "amount":       st.column_config.NumberColumn("Amount",     format="AED %.2f", min_value=0),
         "type":         st.column_config.SelectboxColumn("Type",    options=["debit", "credit"]),
-        "category":     st.column_config.SelectboxColumn(
+        "category":     st.column_config.TextColumn(
                             "Category",
-                            options=[""] + _cat_options,
-                            required=False,
                             width="medium",
-                            help="Auto-assigned from category rules — edit to override",
+                            help="Auto-assigned from category rules — type to override or enter a new category",
                         ),
         "account_name": st.column_config.TextColumn("Account"),
         "currency":     st.column_config.SelectboxColumn("Currency",options=["AED", "USD", "EUR", "GBP", "INR"]),

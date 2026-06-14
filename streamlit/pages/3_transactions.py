@@ -6,7 +6,7 @@ from dateutil.relativedelta import relativedelta
 from auth import require_login
 from sidebar import render_sidebar
 from utils import apply_theme
-from firefly_api import get_transactions, get_accounts
+from firefly_api import get_transactions, get_accounts, get_categories, update_transaction
 
 st.set_page_config(
     page_title="Transactions — Household Finance",
@@ -192,43 +192,112 @@ if df.empty:
     st.stop()
 
 # ── Map type labels and prepare display frame ─────────────────────────────────
-display_df = df.drop(columns=["id"]).sort_values("date", ascending=False).copy()
-display_df["type"] = display_df["type"].map({"withdrawal": "Expense", "deposit": "Income"})
-display_df["date"] = display_df["date"].dt.strftime("%Y-%m-%d")
+# df_sorted keeps "id" and raw "type"; display_df mirrors it without id, with friendly labels.
+df_sorted = df.sort_values("date", ascending=False).reset_index(drop=True)
+display_df = df_sorted.drop(columns=["id"]).copy()
+display_df["type"] = display_df["type"].map(
+    {"withdrawal": "Expense", "deposit": "Income", "transfer": "Transfer"}
+)
+display_df["date"] = display_df["date"].dt.date  # keep as date for data_editor DateColumn
 
-selected = st.dataframe(
+# ── Load existing categories for the dropdown ─────────────────────────────────
+_NEW_CAT_SENTINEL = "✏️ New category…"
+try:
+    _raw_cats = get_categories()
+    _cat_names = sorted(c["attributes"]["name"] for c in _raw_cats)
+except Exception:
+    _cat_names = []
+
+# Include any categories already on displayed transactions that aren't in Firefly's list yet
+_extra_cats = sorted(
+    c for c in display_df["category"].dropna().unique()
+    if c and c != "Uncategorised" and c not in _cat_names
+)
+_cat_options = [_NEW_CAT_SENTINEL, "Uncategorised"] + _cat_names + _extra_cats
+
+st.caption(
+    "Select a category from the dropdown, or choose **✏️ New category…** and type a name below. "
+    "Click **Save changes** when done."
+)
+
+edited_df = st.data_editor(
     display_df,
     use_container_width=True,
     height=500,
     hide_index=True,
-    on_select="rerun",
-    selection_mode="single-row",
+    disabled=["account", "currency"],
     column_config={
-        "date":        st.column_config.TextColumn("Date",        width="small"),
+        "date":        st.column_config.DateColumn("Date", format="YYYY-MM-DD", width="small"),
         "description": st.column_config.TextColumn("Description", width="large"),
-        "amount":      st.column_config.NumberColumn("Amount",    format="AED %.2f", width="small"),
-        "type":        st.column_config.TextColumn("Type",        width="small"),
-        "category":    st.column_config.TextColumn("Category",    width="medium"),
-        "account":     st.column_config.TextColumn("Account",     width="medium"),
-        "currency":    st.column_config.TextColumn("Currency",    width="small"),
+        "amount":      st.column_config.NumberColumn("Amount", format="AED %.2f", min_value=0, width="small"),
+        "type":        st.column_config.SelectboxColumn("Type", options=["Expense", "Income", "Transfer"], width="small"),
+        "category":    st.column_config.SelectboxColumn("Category", options=_cat_options, width="medium"),
+        "account":     st.column_config.TextColumn("Account", width="medium"),
+        "currency":    st.column_config.TextColumn("Currency", width="small"),
     },
 )
 
-# ── Row detail ────────────────────────────────────────────────────────────────
-if selected and selected.get("selection", {}).get("rows"):
-    row = display_df.iloc[selected["selection"]["rows"][0]]
-    with st.container(border=True):
-        st.markdown("**Transaction detail**")
-        d1, d2, d3 = st.columns(3)
-        with d1:
-            st.metric("Amount", f"AED {row['amount']:,.2f}")
-            st.write(f"**Date:** {row['date']}")
-        with d2:
-            st.write(f"**Description:** {row['description']}")
-            st.write(f"**Type:** {row['type']}")
-        with d3:
-            st.write(f"**Category:** {row['category']}")
-            st.write(f"**Account:** {row['account']}")
+# ── New-category text input (shown only when sentinel is selected) ─────────────
+_sentinel_rows = (edited_df["category"] == _NEW_CAT_SENTINEL)
+_new_cat_name = ""
+if _sentinel_rows.any():
+    _new_cat_name = st.text_input(
+        "New category name",
+        placeholder="e.g. Subscriptions",
+        key="txn_new_cat_input",
+    )
+
+# ── Detect changes ────────────────────────────────────────────────────────────
+try:
+    changed_mask = ~(edited_df.astype(str) == display_df.astype(str)).all(axis=1)
+except Exception:
+    changed_mask = pd.Series([False] * len(edited_df))
+
+n_changed = int(changed_mask.sum())
+
+btn_col, info_col = st.columns([1, 4])
+with btn_col:
+    save_clicked = st.button("Save changes", type="primary", disabled=(n_changed == 0))
+with info_col:
+    if n_changed > 0:
+        st.caption(f"{n_changed} row(s) modified — click Save to push to Firefly.")
+
+if save_clicked:
+    # Substitute sentinel with typed new category name
+    if _sentinel_rows.any():
+        if not _new_cat_name.strip():
+            st.error("Enter a name for the new category before saving.")
+            st.stop()
+        edited_df = edited_df.copy()
+        edited_df.loc[_sentinel_rows, "category"] = _new_cat_name.strip()
+
+    type_map = {"Expense": "withdrawal", "Income": "deposit", "Transfer": "transfer"}
+    saved, errors = 0, []
+    for idx in edited_df[changed_mask].index:
+        row = edited_df.iloc[idx]
+        txn_id = df_sorted.iloc[idx]["id"]
+        d = row["date"]
+        date_str = (d.isoformat() if hasattr(d, "isoformat") else str(d)) + "T00:00:00+00:00"
+        fields = {
+            "description": str(row["description"]),
+            "date": date_str,
+            "amount": str(row["amount"]),
+            "type": type_map.get(row["type"], "withdrawal"),
+        }
+        cat = row["category"]
+        if cat and cat != "Uncategorised":
+            fields["category_name"] = cat
+        try:
+            update_transaction(txn_id, fields)
+            saved += 1
+        except Exception as exc:
+            errors.append(f"Row {idx + 1}: {exc}")
+    if saved:
+        st.success(f"{saved} transaction(s) updated.")
+    if errors:
+        st.error("\n".join(errors))
+    if saved:
+        st.rerun()
 
 # ── Export ────────────────────────────────────────────────────────────────────
 st.download_button(

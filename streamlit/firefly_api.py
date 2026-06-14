@@ -109,6 +109,19 @@ def create_category(name: str) -> dict:
     return resp.json()
 
 
+def update_transaction(txn_id: str, fields: dict) -> bool:
+    """PUT /api/v1/transactions/{id} — update mutable fields on an existing transaction."""
+    payload = {"apply_rules": False, "transactions": [fields]}
+    resp = requests.put(
+        f"{FIREFLY_URL}/api/v1/transactions/{txn_id}",
+        headers=_headers(),
+        json=payload,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return True
+
+
 def create_rule(name: str, trigger: str, action_value: str) -> dict:
     payload = {
         "title": name,

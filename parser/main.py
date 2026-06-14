@@ -149,31 +149,43 @@ def _save_category_rules(rules: list) -> None:
     _CATEGORIES_FILE.write_text(json.dumps(rules, indent=2))
 
 
-def _all_patterns(rules: list, exclude_id: str = None, scoped_account: str = None) -> dict[str, str]:
+def _all_patterns(
+    rules: list,
+    exclude_id: str = None,
+    scoped_account: str = None,
+    scoped_txn_type: str = None,
+) -> dict[str, str]:
     """
     Return {pattern_lower: label} for patterns that would conflict when adding to a rule
-    scoped to `scoped_account` (None = global rule).
+    scoped to `scoped_account` (None = global) and `scoped_txn_type` (None = both types).
 
     Conflict rules:
-      global vs global          → conflict  (same pattern, both unscoped)
-      account-A vs account-A    → conflict  (same pattern, same account)
+      Same account scope AND overlapping transaction type → conflict
       global vs account-specific → no conflict (account-specific overrides global)
-      account-A vs account-B    → no conflict  (different accounts, both exclusive)
+      account-A vs account-B    → no conflict
+      withdrawal vs deposit     → no conflict (disjoint types)
+      withdrawal vs None (both) → conflict (the "both" rule overlaps withdrawal)
     """
     norm = lambda s: (s or "").strip().lower() or None
     scoped = norm(scoped_account)
+    scoped_tt = norm(scoped_txn_type)
     out = {}
     for rule in rules:
         if rule.get("id") == exclude_id:
             continue
         rule_acc = norm(rule.get("account"))
-        # Only include rules that are in the same "scope bucket"
+        # Same account-scope bucket check
         if scoped is None and rule_acc is not None:
             continue  # global vs account-specific → no conflict
         if scoped is not None and rule_acc is None:
             continue  # account-specific vs global → no conflict
         if scoped is not None and rule_acc is not None and rule_acc != scoped:
             continue  # different accounts → no conflict
+        # Transaction-type overlap check
+        rule_tt = norm(rule.get("transaction_type"))
+        # No overlap only when both types are specific AND different
+        if scoped_tt and rule_tt and scoped_tt != rule_tt:
+            continue  # e.g. withdrawal vs deposit → no conflict
         label = f"{rule.get('category', '')} > {rule.get('subcategory', '')}".strip(" >")
         if rule_acc:
             label += f" [{rule.get('account')}]"
@@ -263,14 +275,17 @@ async def create_category_rule(rule: dict):
     category = (rule.get("category") or "").strip()
     subcategory = (rule.get("subcategory") or "").strip()
     account = (rule.get("account") or "").strip() or None
+    transaction_type = (rule.get("transaction_type") or "").strip().lower() or None
     patterns = [p.strip().lower() for p in rule.get("patterns", []) if p.strip()]
     if not category:
         raise HTTPException(status_code=400, detail="category is required")
     if not patterns:
         raise HTTPException(status_code=400, detail="at least one pattern is required")
+    if transaction_type and transaction_type not in ("withdrawal", "deposit"):
+        raise HTTPException(status_code=400, detail="transaction_type must be 'withdrawal', 'deposit', or null")
 
     existing = _load_category_rules()
-    taken = _all_patterns(existing, scoped_account=account)
+    taken = _all_patterns(existing, scoped_account=account, scoped_txn_type=transaction_type)
     conflicts = [{"pattern": p, "rule": taken[p]} for p in patterns if p in taken]
     if conflicts:
         raise HTTPException(status_code=409, detail={"conflicts": conflicts})
@@ -283,6 +298,8 @@ async def create_category_rule(rule: dict):
     }
     if account:
         new_rule["account"] = account
+    if transaction_type:
+        new_rule["transaction_type"] = transaction_type
     existing.append(new_rule)
     _save_category_rules(existing)
     return {"success": True, "rule": new_rule}
@@ -290,7 +307,7 @@ async def create_category_rule(rule: dict):
 
 @app.patch("/category-rules/{rule_id}")
 async def update_category_rule(rule_id: str, body: dict):
-    """Rename category/subcategory/account of an existing rule (does not touch patterns)."""
+    """Rename category/subcategory/account/transaction_type of an existing rule (does not touch patterns)."""
     rules = _load_category_rules()
     for rule in rules:
         if rule.get("id") == rule_id:
@@ -304,6 +321,12 @@ async def update_category_rule(rule_id: str, body: dict):
                     rule["account"] = acc
                 else:
                     rule.pop("account", None)
+            if "transaction_type" in body:
+                tt = (body["transaction_type"] or "").strip().lower() or None
+                if tt:
+                    rule["transaction_type"] = tt
+                else:
+                    rule.pop("transaction_type", None)
             break
     else:
         raise HTTPException(status_code=404, detail="rule not found")
@@ -326,13 +349,14 @@ async def add_pattern(rule_id: str, body: dict):
         raise HTTPException(status_code=400, detail="pattern is required")
 
     rules = _load_category_rules()
-    # Find the rule's own account so conflict check uses the right scope
+    # Find the rule's own account and transaction_type so conflict check uses the right scope
     target = next((r for r in rules if r.get("id") == rule_id), None)
     if not target:
         raise HTTPException(status_code=404, detail="rule not found")
     rule_account = (target.get("account") or "").strip() or None
+    rule_txn_type = (target.get("transaction_type") or "").strip() or None
 
-    taken = _all_patterns(rules, exclude_id=rule_id, scoped_account=rule_account)
+    taken = _all_patterns(rules, exclude_id=rule_id, scoped_account=rule_account, scoped_txn_type=rule_txn_type)
     if pattern in taken:
         raise HTTPException(
             status_code=409,
@@ -450,6 +474,24 @@ async def parse_statement(
 def get_rules_effective():
     """Return all active transfer rules (user-defined + built-in) tagged with origin."""
     return {"rules": get_effective_transfer_rules()}
+
+
+@app.put("/rules/user")
+async def replace_user_rules(body: dict):
+    """Replace all user-defined transfer rules wholesale."""
+    rules = body.get("rules", {})
+    if not isinstance(rules, dict):
+        raise HTTPException(status_code=400, detail="rules must be a dict keyed by account name")
+    for account, rule_list in rules.items():
+        if not isinstance(rule_list, list):
+            raise HTTPException(status_code=400, detail=f"Rules for '{account}' must be a list")
+        for rule in rule_list:
+            if not rule.get("keyword"):
+                raise HTTPException(status_code=400, detail=f"Rule for '{account}' missing keyword")
+            if rule.get("action") != "skip" and not rule.get("other_account"):
+                raise HTTPException(status_code=400, detail=f"Transfer rule for '{account}' missing other_account")
+    _save_transfer_rules(rules)
+    return {"success": True, "accounts": len(rules)}
 
 
 @app.post("/rules/apply")

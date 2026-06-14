@@ -64,8 +64,8 @@ _DEFAULT_TRANSFER_RULES: dict = {
         {"keyword": "AE160860000006198732111", "other_account": "Wio bank account"},
         # CC bill payment — description is exactly "Transfer" on FAB bank side
         {"keyword": "Transfer", "match": "exact", "other_account": "FAB Credit Card"},
-        # Wio → FAB arriving (WIOB AEAD = Wio Bank SWIFT; credit/destination side)
-        {"keyword": "WIOB AEAD", "action": "skip"},
+        # Wio → FAB arriving (WIOBAEAD = Wio Bank SWIFT; credit/destination side)
+        {"keyword": "WIOBAEAD", "action": "skip"},
     ],
     # ── FAB Credit Card ───────────────────────────────────────────────────────
     "FAB Credit Card": [
@@ -404,28 +404,34 @@ def apply_category_rules_to_transactions(rules: list) -> dict:
         return {"success": True, "updated_count": 0, "skipped_count": 0,
                 "error_count": 0, "errors": [], "category_counts": {}}
 
-    # Flatten rules into an ordered lookup list [(pattern, category_name, account_or_None)]
-    # account=None means the rule is global (matches any account)
-    lookup: list[tuple[str, str, str | None]] = []
+    # Flatten rules into an ordered lookup list
+    # tuple: (pattern, category_name, rule_account, rule_txn_type)
+    # rule_account=None → global; rule_txn_type=None → both types
+    lookup: list[tuple[str, str, str | None, str | None]] = []
     for rule in rules:
         subcat = (rule.get("subcategory") or "").strip()
         cat = (rule.get("category") or "").strip()
         category_name = subcat if subcat else cat
         rule_account = (rule.get("account") or "").strip().lower() or None
+        rule_txn_type = (rule.get("transaction_type") or "").strip().lower() or None
         for p in rule.get("patterns", []):
             p = p.strip().lower()
             if p:
-                lookup.append((p, category_name, rule_account))
+                lookup.append((p, category_name, rule_account, rule_txn_type))
 
-    def _match(description: str, account_name: str) -> str | None:
+    def _match(description: str, account_name: str, txn_type: str) -> str | None:
         desc_lower = description.lower()
         acc_lower = (account_name or "").lower()
         # Pass 1: account-specific rules take priority
-        for pattern, category, rule_account in lookup:
+        for pattern, category, rule_account, rule_txn_type in lookup:
+            if rule_txn_type and rule_txn_type != txn_type:
+                continue
             if rule_account and rule_account == acc_lower and pattern in desc_lower:
                 return category
         # Pass 2: global rules
-        for pattern, category, rule_account in lookup:
+        for pattern, category, rule_account, rule_txn_type in lookup:
+            if rule_txn_type and rule_txn_type != txn_type:
+                continue
             if not rule_account and pattern in desc_lower:
                 return category
         return None
@@ -463,7 +469,7 @@ def apply_category_rules_to_transactions(rules: list) -> dict:
                     else split.get("destination_name", "")
                 )
 
-                category = _match(description, account_name)
+                category = _match(description, account_name, txn_type)
                 if not category:
                     skipped += 1
                     continue

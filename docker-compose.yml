@@ -123,10 +123,20 @@ services:
 
 volumes:
   postgres_data:
+    name: expense-tracker-v2_postgres_data
+    external: true
   firefly_uploads:
+    name: expense-tracker-v2_firefly_uploads
+    external: true
   caddy_data:
+    name: expense-tracker-v2_caddy_data
+    external: true
   caddy_config:
+    name: expense-tracker-v2_caddy_config
+    external: true
   parser_data:
+    name: expense-tracker-v2_parser_data
+    external: true
 
 networks:
   backend:
