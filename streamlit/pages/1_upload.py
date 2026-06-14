@@ -89,9 +89,10 @@ else:
 # ── Transfer rules ────────────────────────────────────────────────────────────
 with st.expander("⚙️ Transfer rules for this account", expanded=False):
     st.caption(
-        "Define keyword patterns that mark a transaction as an internal transfer. "
-        "Example: when FAB Credit Card sees 'PAYMENT RECEIVED', treat it as a transfer "
-        "from your bank account — no Firefly rules needed."
+        "User-defined rules that run before the built-in defaults. "
+        "**Transfer** rules import a transaction as an internal transfer to another account. "
+        "**Skip** rules drop a transaction entirely — use this for the destination side of a "
+        "transfer that is already imported from the source account's statement."
     )
     try:
         _tr_resp = requests.get(
@@ -103,12 +104,17 @@ with st.expander("⚙️ Transfer rules for this account", expanded=False):
         _existing_rules = []
 
     if _existing_rules:
-        st.markdown("**Saved rules:**")
+        st.markdown("**Your rules** (checked before built-in defaults):")
         for _i, _rule in enumerate(_existing_rules):
             _rc1, _rc2 = st.columns([6, 1])
-            _rc1.markdown(
-                f"Description contains **\"{_rule['keyword']}\"** → transfer with **{_rule['other_account']}**"
-            )
+            if _rule.get("action") == "skip":
+                _rc1.markdown(
+                    f"Description contains **\"{_rule['keyword']}\"** → ⛔ **skip** (not imported)"
+                )
+            else:
+                _rc1.markdown(
+                    f"Description contains **\"{_rule['keyword']}\"** → 🔁 transfer with **{_rule.get('other_account', '?')}**"
+                )
             if _rc2.button("Delete", key=f"del_rule_{_i}"):
                 try:
                     requests.delete(
@@ -119,24 +125,36 @@ with st.expander("⚙️ Transfer rules for this account", expanded=False):
                 except Exception as _e:
                     st.warning(f"Could not delete rule: {_e}")
     else:
-        st.caption("No rules yet for this account.")
+        st.caption("No custom rules yet — built-in defaults are still active.")
 
     st.markdown("**Add a rule:**")
-    _ra1, _ra2 = st.columns([3, 4])
+    _ra1, _ra2, _ra3 = st.columns([3, 2, 3])
     _new_keyword = _ra1.text_input(
         "Description keyword", placeholder="e.g. PAYMENT RECEIVED", key="new_rule_kw"
     )
+    _rule_action = _ra2.radio("Action", ["Transfer to", "Skip"], key="new_rule_action", horizontal=True)
     _acct_opts = [a for a in account_options.keys() if a != selected_account]
-    _other_acct = _ra2.selectbox("Transfer to/from account", _acct_opts, key="new_rule_acct")
+    _other_acct = _ra3.selectbox(
+        "Other account",
+        _acct_opts,
+        key="new_rule_acct",
+        disabled=(_rule_action == "Skip"),
+    )
     if st.button("Add rule", key="add_rule_btn"):
         if _new_keyword:
             try:
+                if _rule_action == "Skip":
+                    _payload = {"keyword": _new_keyword, "action": "skip"}
+                    _label = f"\"{_new_keyword}\" → skip"
+                else:
+                    _payload = {"keyword": _new_keyword, "other_account": _other_acct}
+                    _label = f"\"{_new_keyword}\" → {_other_acct}"
                 requests.post(
                     f"{PARSER_URL}/transfer-rules/{quote(selected_account, safe='')}",
-                    json={"keyword": _new_keyword, "other_account": _other_acct},
+                    json=_payload,
                     timeout=5,
                 )
-                st.success(f"Rule added: \"{_new_keyword}\" → {_other_acct}")
+                st.success(f"Rule added: {_label}")
                 st.rerun()
             except Exception as _e:
                 st.warning(f"Could not add rule: {_e}")
@@ -156,6 +174,37 @@ else:
     _step = 2
 
 step_indicator(["Account", "Upload File", "Parse", "Review & Import"], _step)
+
+
+# ── Category matcher (mirrors firefly_client 2-pass logic) ───────────────────
+def _apply_categories(transactions: list, rules: list, default_account: str) -> list:
+    lookup = []
+    for rule in rules:
+        subcat = (rule.get("subcategory") or "").strip()
+        cat    = (rule.get("category")    or "").strip()
+        category_name = subcat if subcat else cat
+        rule_account  = (rule.get("account") or "").strip().lower() or None
+        for p in rule.get("patterns", []):
+            p = p.strip().lower()
+            if p:
+                lookup.append((p, category_name, rule_account))
+
+    def _match(description: str, account_name: str) -> str:
+        desc_lower = description.lower()
+        acc_lower  = (account_name or "").lower()
+        for pattern, category, ra in lookup:      # pass 1: account-specific
+            if ra and ra == acc_lower and pattern in desc_lower:
+                return category
+        for pattern, category, ra in lookup:      # pass 2: global
+            if not ra and pattern in desc_lower:
+                return category
+        return ""
+
+    for txn in transactions:
+        if not txn.get("category"):               # don't overwrite manually set values
+            acc = txn.get("account_name") or default_account
+            txn["category"] = _match(txn.get("description", ""), acc)
+    return transactions
 
 
 # ── CSV parser ────────────────────────────────────────────────────────────────
@@ -251,7 +300,6 @@ if uploaded_file is not None:
             try:
                 if is_csv:
                     result = _parse_csv(uploaded_file.getvalue(), selected_account)
-                    st.session_state["parse_result"] = result
                 else:
                     resp = requests.post(
                         f"{PARSER_URL}/parse",
@@ -269,7 +317,17 @@ if uploaded_file is not None:
                         st.error("❌ Incorrect PDF password. Please check and try again.")
                         st.stop()
 
-                    st.session_state["parse_result"] = result
+                # Fetch category rules and auto-assign to extracted transactions
+                try:
+                    _cr = requests.get(f"{PARSER_URL}/category-rules", timeout=5)
+                    cat_rules = _cr.json().get("rules", []) if _cr.ok else []
+                except Exception:
+                    cat_rules = []
+                result["transactions"] = _apply_categories(
+                    result.get("transactions", []), cat_rules, selected_account
+                )
+                st.session_state["cat_rules"] = cat_rules
+                st.session_state["parse_result"] = result
             except Exception as exc:
                 st.error(f"Parser error: {exc}")
                 st.stop()
@@ -304,15 +362,37 @@ if "parse_result" in st.session_state:
     # ── 4. Editable transaction table ─────────────────────────────────────────
     st.subheader("4. Transactions")
 
+    # Build category option list from cached rules
+    _cat_rules = st.session_state.get("cat_rules", [])
+    _cat_options = sorted(set(
+        ((r.get("subcategory") or r.get("category", "")).strip())
+        for r in _cat_rules
+        if (r.get("subcategory") or r.get("category", "")).strip()
+    ))
+
     df = pd.DataFrame(transactions)
+    if "category" not in df.columns:
+        df["category"] = ""
     if not df.empty and "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
+    # Keep a consistent, readable column order
+    _preferred_order = ["date", "description", "amount", "type", "category",
+                        "account_name", "currency", "balance_after"]
+    df = df[[c for c in _preferred_order if c in df.columns]]
 
     _col_config = {
         "date":         st.column_config.DateColumn("Date",         format="YYYY-MM-DD"),
         "description":  st.column_config.TextColumn("Description",  width="large"),
         "amount":       st.column_config.NumberColumn("Amount",     format="AED %.2f", min_value=0),
         "type":         st.column_config.SelectboxColumn("Type",    options=["debit", "credit"]),
+        "category":     st.column_config.SelectboxColumn(
+                            "Category",
+                            options=[""] + _cat_options,
+                            required=False,
+                            width="medium",
+                            help="Auto-assigned from category rules — edit to override",
+                        ),
         "account_name": st.column_config.TextColumn("Account"),
         "currency":     st.column_config.SelectboxColumn("Currency",options=["AED", "USD", "EUR", "GBP", "INR"]),
         "balance_after":st.column_config.NumberColumn("Balance after", format="AED %.2f"),
@@ -360,11 +440,15 @@ if "parse_result" in st.session_state:
                 import_result = import_resp.json()
 
                 if import_result.get("success"):
-                    st.success(f"✅ Imported {import_result.get('imported_count', 0)} transactions!")
+                    _imported = import_result.get("imported_count", 0)
+                    _skipped = import_result.get("skipped_count", 0)
+                    _skip_note = f" ({_skipped} skipped as transfer destination)" if _skipped else ""
+                    st.success(f"✅ Imported {_imported} transactions{_skip_note}!")
                     history = st.session_state.get("import_history", [])
                     history.insert(0, {
                         "Account": selected_account,
-                        "Imported": import_result.get("imported_count", 0),
+                        "Imported": _imported,
+                        "Skipped": _skipped,
                         "Status": "✅ Success",
                         "Method": result.get("extraction_method"),
                     })
@@ -391,6 +475,7 @@ if history:
         column_config={
             "Account":  st.column_config.TextColumn("Account"),
             "Imported": st.column_config.NumberColumn("Imported", format="%d txns"),
+            "Skipped":  st.column_config.NumberColumn("Skipped", format="%d txns"),
             "Status":   st.column_config.TextColumn("Status"),
             "Method":   st.column_config.TextColumn("Method"),
         },
