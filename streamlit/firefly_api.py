@@ -122,6 +122,30 @@ def update_transaction(txn_id: str, fields: dict) -> bool:
     return True
 
 
+def create_transaction(fields: dict) -> bool:
+    """POST /api/v1/transactions — create a brand-new transaction."""
+    payload = {"apply_rules": False, "transactions": [fields]}
+    resp = requests.post(
+        f"{FIREFLY_URL}/api/v1/transactions",
+        headers=_headers(),
+        json=payload,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return True
+
+
+def delete_transaction(txn_id: str) -> bool:
+    """DELETE /api/v1/transactions/{id}."""
+    resp = requests.delete(
+        f"{FIREFLY_URL}/api/v1/transactions/{txn_id}",
+        headers=_headers(),
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return True
+
+
 def create_rule(name: str, trigger: str, action_value: str) -> dict:
     payload = {
         "title": name,

@@ -1,8 +1,10 @@
 import os
 import json
 import uuid
+import hashlib
 import tempfile
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import JSONResponse
@@ -19,6 +21,7 @@ app = FastAPI(title="PDF Parser Service", version="1.0.0")
 _PASSWORDS_FILE = Path(os.getenv("PASSWORDS_FILE", "/data/passwords.json"))
 _TRANSFER_RULES_FILE = Path(os.getenv("TRANSFER_RULES_FILE", "/data/transfer_rules.json"))
 _CATEGORIES_FILE = Path(os.getenv("CATEGORIES_FILE", "/data/categories.json"))
+_UPLOAD_HISTORY_FILE = Path(os.getenv("UPLOAD_HISTORY_FILE", "/data/upload_history.json"))
 
 
 def _load_passwords() -> dict:
@@ -40,6 +43,40 @@ def _delete_password(account_name: str) -> None:
     if account_name in passwords:
         passwords.pop(account_name)
         _PASSWORDS_FILE.write_text(json.dumps(passwords, indent=2))
+
+
+# ── Upload-history helpers (Layer 1 dedup) ────────────────────────────────────
+
+def _load_upload_history() -> list:
+    try:
+        return json.loads(_UPLOAD_HISTORY_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def _save_upload_history(history: list) -> None:
+    _UPLOAD_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _UPLOAD_HISTORY_FILE.write_text(json.dumps(history, indent=2))
+
+
+def _find_in_history(file_hash: str) -> dict | None:
+    """Return the history entry for this hash, or None if not seen before."""
+    for entry in _load_upload_history():
+        if entry.get("hash") == file_hash:
+            return entry
+    return None
+
+
+def _record_upload(file_hash: str, filename: str, account: str, imported_count: int) -> None:
+    history = _load_upload_history()
+    history.append({
+        "hash": file_hash,
+        "filename": filename,
+        "account": account,
+        "imported_at": datetime.now(timezone.utc).isoformat(),
+        "imported_count": imported_count,
+    })
+    _save_upload_history(history)
 
 
 # ── Category-rule helpers ─────────────────────────────────────────────────────
@@ -419,8 +456,10 @@ async def parse_statement(
         content = await file.read()
         tmp.write(content)
 
+    file_hash = hashlib.sha256(content).hexdigest()
+
     try:
-        logger.info("Extracting transactions from %s", file.filename)
+        logger.info("Extracting transactions from %s (hash=%s…)", file.filename, file_hash[:12])
         result = extract_with_pdfplumber(tmp_path, account_name, effective_password)
 
         # PDF is encrypted and the password was wrong or missing — bubble up to UI
@@ -432,6 +471,7 @@ async def parse_statement(
                 "metadata": {},
                 "transactions": [],
                 "balance_check": {},
+                "file_hash": file_hash,
             })
 
         # A newly-supplied password worked — save it for future uploads of this account
@@ -452,7 +492,13 @@ async def parse_statement(
             "metadata": result.get("metadata", {}),
             "transactions": result["transactions"],
             "balance_check": verification,
+            "file_hash": file_hash,
         }
+
+        # Layer 1: warn if this exact file was imported before
+        prior = _find_in_history(file_hash)
+        if prior:
+            response["duplicate_file"] = prior
 
         balance_confirmed = verification.get("passed") and verification.get("reason") == "ok"
         if balance_confirmed and result["confidence"] >= 0.7:
@@ -501,6 +547,15 @@ async def apply_rules():
     return result
 
 
+@app.get("/upload-history/{file_hash}")
+def check_upload_history(file_hash: str):
+    """Return the prior upload record for this SHA-256 hash, or 404 if new."""
+    entry = _find_in_history(file_hash)
+    if entry:
+        return {"duplicate": True, "prior_upload": entry}
+    return {"duplicate": False}
+
+
 @app.post("/import")
 async def import_to_firefly(payload: dict):
     """Push a verified transactions payload directly to Firefly importer."""
@@ -509,4 +564,12 @@ async def import_to_firefly(payload: dict):
         raise HTTPException(status_code=400, detail="No transactions provided")
 
     result = push_to_firefly(transactions)
+
+    # Record the file in upload history so Layer 1 can detect re-uploads
+    file_hash = payload.get("file_hash")
+    filename = payload.get("filename", "")
+    account = payload.get("account", "")
+    if file_hash and result.get("imported_count", 0) + result.get("duplicate_count", 0) > 0:
+        _record_upload(file_hash, filename, account, result.get("imported_count", 0))
+
     return result

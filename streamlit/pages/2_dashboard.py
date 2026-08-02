@@ -163,7 +163,9 @@ with r1c1:
         )
         # Collapse tail into "Other" so the donut stays readable
         TOP_N = 8
+        _other_cats: list[str] = []
         if len(cat_df) > TOP_N:
+            _other_cats = cat_df.iloc[TOP_N:]["category"].tolist()
             other_sum = cat_df.iloc[TOP_N:]["amount"].sum()
             cat_df = pd.concat(
                 [cat_df.head(TOP_N), pd.DataFrame([{"category": "Other", "amount": other_sum}])],
@@ -185,7 +187,33 @@ with r1c1:
             margin=dict(l=0, r=130, t=10, b=10),
             height=350,
         )
-        st.plotly_chart(fig, use_container_width=True)
+        pie_event = st.plotly_chart(
+            fig, use_container_width=True, on_select="rerun", key="db_pie"
+        )
+
+        # Drill-down: show transactions for the clicked slice
+        _selected_pts = (pie_event or {}).get("selection", {}).get("points", [])
+        if _selected_pts:
+            _clicked_cat = _selected_pts[0].get("label", "")
+            if _clicked_cat == "Other":
+                _drill_mask = debits["category"].isin(_other_cats)
+                _drill_title = "Other categories"
+            else:
+                _drill_mask = debits["category"] == _clicked_cat
+                _drill_title = _clicked_cat
+
+            _drill_df = (
+                debits[_drill_mask][["date", "description", "amount", "account"]]
+                .sort_values("amount", ascending=False)
+                .copy()
+            )
+            _drill_df["date"] = _drill_df["date"].dt.strftime("%d %b")
+            _drill_df["amount"] = _drill_df["amount"].map(lambda x: f"AED {x:,.2f}")
+            _drill_df.columns = ["Date", "Description", "Amount", "Account"]
+
+            with st.container(border=True):
+                st.markdown(f"**{_drill_title}** — {len(_drill_df)} transactions")
+                st.dataframe(_drill_df, use_container_width=True, hide_index=True)
     else:
         st.info("No debit transactions.")
 

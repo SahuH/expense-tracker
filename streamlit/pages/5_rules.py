@@ -6,9 +6,10 @@ import os
 from auth import require_login
 from sidebar import render_sidebar
 from utils import apply_theme
+from firefly_api import get_accounts
 
 st.set_page_config(
-    page_title="Transfer Rules — Household Finance",
+    page_title="Transfers — Household Finance",
     page_icon="💰",
     layout="wide",
 )
@@ -23,12 +24,19 @@ render_sidebar()
 
 PARSER_URL = os.getenv("PARSER_URL", "http://parser:8000")
 
-st.title("Transfer Rules")
+st.title("Transfers")
 st.caption(
     "Rules that control how transactions are classified during import. "
     "**Built-in** rules are hard-coded for known account patterns. "
     "**Custom** rules take priority and can be edited below."
 )
+
+# ── Load Firefly asset accounts for dropdowns ──────────────────────────────────
+try:
+    _raw_accounts = get_accounts()
+    _account_names = sorted(a["attributes"]["name"] for a in _raw_accounts)
+except Exception:
+    _account_names = []
 
 # ── Fetch effective rules ──────────────────────────────────────────────────────
 try:
@@ -77,11 +85,11 @@ _edited_user_df = st.data_editor(
     hide_index=True,
     num_rows="dynamic",
     column_config={
-        "Account":             st.column_config.TextColumn("Account", width="medium"),
+        "Account":             st.column_config.SelectboxColumn("Account", options=_account_names, width="medium"),
         "Keyword":             st.column_config.TextColumn("Keyword", width="medium"),
         "Match":               st.column_config.SelectboxColumn("Match", options=["contains", "exact"], width="small"),
         "Action":              st.column_config.SelectboxColumn("Action", options=["Transfer to →", "Skip (drop)"], width="medium"),
-        "Counterpart account": st.column_config.TextColumn("Counterpart account", width="large"),
+        "Counterpart account": st.column_config.SelectboxColumn("Counterpart account", options=_account_names, width="large"),
     },
 )
 

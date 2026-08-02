@@ -115,7 +115,7 @@ with c4:
 
 with c5:
     with st.container(border=True):
-        st.markdown("#### ⚙️ Rules")
+        st.markdown("#### 🔄 Transfers")
         st.caption("View and apply transfer rules that classify internal transactions automatically.")
         st.page_link("pages/5_rules.py", label="Open →")
 

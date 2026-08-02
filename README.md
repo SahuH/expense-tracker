@@ -30,6 +30,20 @@ docker compose up -d
 
 The parser uses pdfplumber to extract transactions deterministically. If extraction confidence is low or the balance check fails, the statement is flagged as `needs_review` and the user can correct transactions in an editable table before importing.
 
+## Stopping and restarting
+
+**Shut down** (stops all containers, all your data is preserved):
+```bash
+docker compose down
+```
+
+**Start back up:**
+```bash
+docker compose up -d
+```
+
+Data is stored in named Docker volumes and is never affected by `docker compose down`. Only `docker compose down -v` would delete volumes — avoid that flag unless you intend to wipe everything.
+
 ## Backup & Restore
 
 ```bash

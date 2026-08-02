@@ -6,7 +6,10 @@ from dateutil.relativedelta import relativedelta
 from auth import require_login
 from sidebar import render_sidebar
 from utils import apply_theme
-from firefly_api import get_transactions, get_accounts, get_categories, update_transaction
+from firefly_api import (
+    get_transactions, get_accounts, get_categories,
+    update_transaction, create_transaction, delete_transaction,
+)
 
 st.set_page_config(
     page_title="Transactions — Household Finance",
@@ -91,7 +94,7 @@ with col1:
 with col2:
     end_date = st.date_input("To", key="txn_end")
 
-with st.spinner("Loading accounts…"):
+with st.spinner("Loading accounts & categories…"):
     try:
         raw_accounts = get_accounts()
         account_map = {"All accounts": None}
@@ -99,10 +102,17 @@ with st.spinner("Loading accounts…"):
     except Exception:
         account_map = {"All accounts": None}
 
+    try:
+        _raw_cats = get_categories()
+        _cat_names = sorted(c["attributes"]["name"] for c in _raw_cats)
+    except Exception:
+        _cat_names = []
+
 with col3:
     selected_account_name = st.selectbox("Account", list(account_map.keys()))
 
 account_id = account_map[selected_account_name]
+_asset_account_names = [k for k in account_map if k != "All accounts"]
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 with st.spinner("Loading transactions…"):
@@ -118,12 +128,52 @@ with st.spinner("Loading transactions…"):
         st.error(f"Failed to load transactions: {exc}")
         st.stop()
 
+# ── Add new transaction ───────────────────────────────────────────────────────
+with st.expander("➕ Add new transaction"):
+    _fa1, _fa2, _fa3 = st.columns(3)
+    _new_date     = _fa1.date_input("Date", value=today, key="add_date")
+    _new_amount   = _fa2.number_input("Amount (AED)", min_value=0.0, step=0.01, format="%.2f", key="add_amount")
+    _new_type     = _fa3.selectbox("Type", ["Expense", "Income"], key="add_type")
+    _new_desc     = st.text_input("Description", key="add_desc")
+    _fb1, _fb2, _fb3 = st.columns(3)
+    _new_cat      = _fb1.selectbox("Category", ["— none —"] + _cat_names, key="add_cat")
+    _new_account  = _fb2.selectbox("Account", _asset_account_names or [""], key="add_acct")
+    _new_currency = _fb3.selectbox("Currency", ["AED", "USD", "EUR", "GBP", "INR"], key="add_curr")
+
+    if st.button("Add transaction", type="primary", key="add_txn_btn"):
+        if not _new_desc.strip() or _new_amount <= 0:
+            st.error("Description and amount are required.")
+        else:
+            _txn_type = "withdrawal" if _new_type == "Expense" else "deposit"
+            _fields = {
+                "type":          _txn_type,
+                "date":          _new_date.isoformat() + "T00:00:00+00:00",
+                "amount":        str(round(_new_amount, 2)),
+                "description":   _new_desc.strip(),
+                "currency_code": _new_currency,
+            }
+            if _new_cat != "— none —":
+                _fields["category_name"] = _new_cat
+            if _txn_type == "withdrawal":
+                _fields["source_name"] = _new_account
+            else:
+                _fields["destination_name"] = _new_account
+            try:
+                create_transaction(_fields)
+                st.success("Transaction added!")
+                for _k in ("add_desc", "add_amount", "add_cat", "add_acct", "add_curr", "add_type", "add_date"):
+                    st.session_state.pop(_k, None)
+                st.rerun()
+            except Exception as _exc:
+                st.error(f"Failed to add: {_exc}")
+
+st.markdown("---")
+
 if df_full.empty:
     st.info("No transactions found for the selected period.")
     st.stop()
 
 # ── Inline client-side filters ────────────────────────────────────────────────
-st.markdown("---")
 f1, f2, f3, f4 = st.columns([2, 3, 2, 1])
 
 with f1:
@@ -131,8 +181,8 @@ with f1:
 with f2:
     search = st.text_input("Search description", placeholder="e.g. Carrefour, Noon", key="txn_search")
 with f3:
-    cat_options = ["All"] + sorted(df_full["category"].dropna().unique().tolist())
-    cat_filter = st.selectbox("Category", cat_options, key="txn_cat")
+    cat_options_filter = ["All"] + sorted(df_full["category"].dropna().unique().tolist())
+    cat_filter = st.selectbox("Category", cat_options_filter, key="txn_cat")
 with f4:
     st.markdown("<div style='margin-top:1.75rem'></div>", unsafe_allow_html=True)
     if st.button("Reset", use_container_width=True, help="Clear all client-side filters"):
@@ -192,23 +242,25 @@ if df.empty:
     st.stop()
 
 # ── Map type labels and prepare display frame ─────────────────────────────────
-# df_sorted keeps "id" and raw "type"; display_df mirrors it without id, with friendly labels.
 df_sorted = df.sort_values("date", ascending=False).reset_index(drop=True)
 display_df = df_sorted.drop(columns=["id"]).copy()
 display_df["type"] = display_df["type"].map(
     {"withdrawal": "Expense", "deposit": "Income", "transfer": "Transfer"}
 )
-display_df["date"] = display_df["date"].dt.date  # keep as date for data_editor DateColumn
+display_df["date"] = display_df["date"].dt.date
 
-# ── Load existing categories for the dropdown ─────────────────────────────────
+# Delete-checkbox column (leftmost)
+display_df.insert(0, "🗑️", False)
+
+# ── Account options (asset accounts + any extra seen in current data) ──────────
+_extra_accounts = sorted(
+    a for a in display_df["account"].dropna().unique()
+    if a and a not in _asset_account_names
+)
+_all_account_options = _asset_account_names + _extra_accounts
+
+# ── Category dropdown options ─────────────────────────────────────────────────
 _NEW_CAT_SENTINEL = "✏️ New category…"
-try:
-    _raw_cats = get_categories()
-    _cat_names = sorted(c["attributes"]["name"] for c in _raw_cats)
-except Exception:
-    _cat_names = []
-
-# Include any categories already on displayed transactions that aren't in Firefly's list yet
 _extra_cats = sorted(
     c for c in display_df["category"].dropna().unique()
     if c and c != "Uncategorised" and c not in _cat_names
@@ -216,7 +268,8 @@ _extra_cats = sorted(
 _cat_options = [_NEW_CAT_SENTINEL, "Uncategorised"] + _cat_names + _extra_cats
 
 st.caption(
-    "Select a category from the dropdown, or choose **✏️ New category…** and type a name below. "
+    "Tick **🗑️** to mark rows for deletion. "
+    "Choose **✏️ New category…** and type below to create a new category. "
     "Click **Save changes** when done."
 )
 
@@ -225,20 +278,20 @@ edited_df = st.data_editor(
     use_container_width=True,
     height=500,
     hide_index=True,
-    disabled=["account", "currency"],
     column_config={
+        "🗑️":        st.column_config.CheckboxColumn("Delete", width="small"),
         "date":        st.column_config.DateColumn("Date", format="YYYY-MM-DD", width="small"),
         "description": st.column_config.TextColumn("Description", width="large"),
         "amount":      st.column_config.NumberColumn("Amount", format="AED %.2f", min_value=0, width="small"),
         "type":        st.column_config.SelectboxColumn("Type", options=["Expense", "Income", "Transfer"], width="small"),
         "category":    st.column_config.SelectboxColumn("Category", options=_cat_options, width="medium"),
-        "account":     st.column_config.TextColumn("Account", width="medium"),
-        "currency":    st.column_config.TextColumn("Currency", width="small"),
+        "account":     st.column_config.SelectboxColumn("Account", options=_all_account_options, width="medium"),
+        "currency":    st.column_config.SelectboxColumn("Currency", options=["AED", "USD", "EUR", "GBP", "INR"], width="small"),
     },
 )
 
 # ── New-category text input (shown only when sentinel is selected) ─────────────
-_sentinel_rows = (edited_df["category"] == _NEW_CAT_SENTINEL)
+_sentinel_rows = edited_df["category"] == _NEW_CAT_SENTINEL
 _new_cat_name = ""
 if _sentinel_rows.any():
     _new_cat_name = st.text_input(
@@ -247,23 +300,39 @@ if _sentinel_rows.any():
         key="txn_new_cat_input",
     )
 
-# ── Detect changes ────────────────────────────────────────────────────────────
+# ── Detect deletions and modifications ────────────────────────────────────────
+_delete_mask = edited_df["🗑️"] == True
+_data_cols = [c for c in edited_df.columns if c != "🗑️"]
+_display_data_cols = [c for c in display_df.columns if c != "🗑️"]
+
 try:
-    changed_mask = ~(edited_df.astype(str) == display_df.astype(str)).all(axis=1)
+    changed_mask = (
+        ~(edited_df[_data_cols].astype(str) == display_df[_display_data_cols].astype(str)).all(axis=1)
+        & ~_delete_mask
+    )
 except Exception:
     changed_mask = pd.Series([False] * len(edited_df))
 
 n_changed = int(changed_mask.sum())
+n_deleted = int(_delete_mask.sum())
 
 btn_col, info_col = st.columns([1, 4])
 with btn_col:
-    save_clicked = st.button("Save changes", type="primary", disabled=(n_changed == 0))
+    save_clicked = st.button(
+        "Save changes",
+        type="primary",
+        disabled=(n_changed == 0 and n_deleted == 0),
+    )
 with info_col:
+    _parts = []
     if n_changed > 0:
-        st.caption(f"{n_changed} row(s) modified — click Save to push to Firefly.")
+        _parts.append(f"{n_changed} modified")
+    if n_deleted > 0:
+        _parts.append(f"{n_deleted} to delete")
+    if _parts:
+        st.caption(", ".join(_parts) + " — click Save to apply.")
 
 if save_clicked:
-    # Substitute sentinel with typed new category name
     if _sentinel_rows.any():
         if not _new_cat_name.strip():
             st.error("Enter a name for the new category before saving.")
@@ -272,18 +341,37 @@ if save_clicked:
         edited_df.loc[_sentinel_rows, "category"] = _new_cat_name.strip()
 
     type_map = {"Expense": "withdrawal", "Income": "deposit", "Transfer": "transfer"}
-    saved, errors = 0, []
+    saved, del_saved, errors = 0, 0, []
+
+    # Deletions
+    for idx in edited_df[_delete_mask].index:
+        txn_id = df_sorted.iloc[idx]["id"]
+        try:
+            delete_transaction(txn_id)
+            del_saved += 1
+        except Exception as exc:
+            errors.append(f"Delete row {idx + 1}: {exc}")
+
+    # Updates
     for idx in edited_df[changed_mask].index:
         row = edited_df.iloc[idx]
         txn_id = df_sorted.iloc[idx]["id"]
         d = row["date"]
         date_str = (d.isoformat() if hasattr(d, "isoformat") else str(d)) + "T00:00:00+00:00"
+        txn_type = type_map.get(row["type"], "withdrawal")
         fields = {
-            "description": str(row["description"]),
-            "date": date_str,
-            "amount": str(row["amount"]),
-            "type": type_map.get(row["type"], "withdrawal"),
+            "description":   str(row["description"]),
+            "date":          date_str,
+            "amount":        str(row["amount"]),
+            "type":          txn_type,
+            "currency_code": str(row["currency"]),
         }
+        acct = str(row.get("account", "") or "")
+        if acct:
+            if txn_type == "deposit":
+                fields["destination_name"] = acct
+            else:
+                fields["source_name"] = acct
         cat = row["category"]
         if cat and cat != "Uncategorised":
             fields["category_name"] = cat
@@ -291,18 +379,24 @@ if save_clicked:
             update_transaction(txn_id, fields)
             saved += 1
         except Exception as exc:
-            errors.append(f"Row {idx + 1}: {exc}")
+            errors.append(f"Update row {idx + 1}: {exc}")
+
+    msgs = []
+    if del_saved:
+        msgs.append(f"{del_saved} deleted")
     if saved:
-        st.success(f"{saved} transaction(s) updated.")
+        msgs.append(f"{saved} updated")
+    if msgs:
+        st.success(", ".join(msgs) + ".")
     if errors:
         st.error("\n".join(errors))
-    if saved:
+    if del_saved or saved:
         st.rerun()
 
 # ── Export ────────────────────────────────────────────────────────────────────
 st.download_button(
     "⬇ Export to CSV",
-    data=display_df.to_csv(index=False).encode("utf-8"),
+    data=display_df.drop(columns=["🗑️"]).to_csv(index=False).encode("utf-8"),
     file_name=f"transactions_{start_date}_{end_date}.csv",
     mime="text/csv",
 )

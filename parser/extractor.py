@@ -33,6 +33,10 @@ DATE_PATTERNS = [
     r"\d{4}-\d{2}-\d{2}",
 ]
 AMOUNT_PATTERN = re.compile(r"[\d,]+\.\d{2}")
+# Matches an amount that is immediately followed by "CR" (credit indicator used by ENBD CC)
+_CR_AMOUNT_RE = re.compile(r"([\d,]+\.\d{2})CR\b", re.IGNORECASE)
+# Arabic and Arabic Presentation Forms scripts (appear in bilingual ENBD/FAB PDFs)
+_ARABIC_RE = re.compile(r"[؀-ۿݐ-ݿﭐ-﷿ﹰ-﻿]+")
 COMBINED_DATE_RE = re.compile("|".join(DATE_PATTERNS))
 # Matches exactly "DD MON YYYY" (3-word date with 3-letter month)
 DATE_3W_RE = re.compile(r"^\d{2}\s+[A-Za-z]{3}\s+\d{4}$")
@@ -47,7 +51,9 @@ _FOOTER_RE = re.compile(
     r"(?:See\s+reverse\s+side"
     r"|(?:FAB\s+Al.Futtaim|Al.Futtaim\s+FAB)\s+Rewards"
     r"|Rewards\s+(?:Balance|Expiring)"
-    r"|Total\s+\d+\s+FAB)",
+    r"|Total\s+\d+\s+FAB"
+    r"|Emirates\s+NBD\s+Bank"             # ENBD footer (English half of bilingual note)
+    r"|\blicensed\s+by\s+the\s+Central\s+Bank\b)",  # ENBD footer continuation
     re.IGNORECASE,
 )
 
@@ -87,6 +93,8 @@ def _clean_description(desc: str, statement_type: str) -> str:
         return desc
     # Universal: strip (cid:N) artifacts
     desc = _CID_RE.sub("", desc)
+    # Universal: strip Arabic script (bilingual ENBD / FAB PDFs embed RTL footer text)
+    desc = _ARABIC_RE.sub("", desc)
     # Universal: truncate at footer / rewards block
     m = _FOOTER_RE.search(desc)
     if m:
@@ -95,6 +103,8 @@ def _clean_description(desc: str, statement_type: str) -> str:
     if statement_type == "credit_card":
         desc = _CC_DATE_PREFIX_RE.sub("", desc)
         desc = _CC_CCY_SUFFIX_RE.sub("", desc)
+    # Collapse any extra whitespace left by removals
+    desc = re.sub(r" {2,}", " ", desc)
     return desc.strip()
 
 
@@ -128,8 +138,30 @@ def _extract_tables(
             for table in tables:
                 if not table or len(table) < 2:
                     continue
-                header = [str(c).lower().strip() if c else "" for c in table[0]]
-                for row in table[1:]:
+
+                def _norm_header(row) -> list:
+                    """Lowercase header cell; replace Arabic column labels with English."""
+                    result = []
+                    for c in row:
+                        h = str(c).lower().strip() if c else ""
+                        for arabic, english in _ARABIC_COL_NORM.items():
+                            if arabic in h:
+                                h = h.replace(arabic, english + " ")
+                        result.append(h)
+                    return result
+
+                header = _norm_header(table[0])
+
+                # If the first row has no recognisable column keywords, it's likely
+                # the Arabic-only half of a bilingual header — try the next row instead.
+                _EN_KEYWORDS = {"date", "debit", "credit", "balance", "detail", "desc"}
+                if not any(any(k in h for k in _EN_KEYWORDS) for h in header) and len(table) > 2:
+                    header = _norm_header(table[1])
+                    data_rows = table[2:]
+                else:
+                    data_rows = table[1:]
+
+                for row in data_rows:
                     if not row or all(c is None or str(c).strip() == "" for c in row):
                         continue
                     txn = _map_row_to_transaction(header, row, account_name, statement_type)
@@ -156,10 +188,18 @@ def _map_row_to_transaction(
             m = AMOUNT_PATTERN.search(cell)
             if m:
                 debit_amount = _parse_amount(m.group())
-        if any(k in col for k in ("credit", "deposit", "cr")):
+        elif any(k in col for k in ("credit", "deposit", "cr")):
             m = AMOUNT_PATTERN.search(cell)
             if m:
                 credit_amount = _parse_amount(m.group())
+        elif "amount" in col:
+            # Single amount column (e.g. ENBD CC): "CR" suffix marks credits/refunds
+            m = AMOUNT_PATTERN.search(cell)
+            if m:
+                if _CR_AMOUNT_RE.search(cell):
+                    credit_amount = _parse_amount(m.group())
+                else:
+                    debit_amount = _parse_amount(m.group())
         if "balance" in col:
             m = AMOUNT_PATTERN.search(cell)
             if m:
@@ -220,8 +260,23 @@ _COL_ALIASES = {
     "credit": "credit", "deposit": "credit", "cr": "credit",
     "balance": "balance",
     "description": "description", "narration": "description", "particulars": "description",
+    # Arabic column labels (bilingual ENBD / Emirates PDFs)
+    "التاريخ": "date",
+    "التفاصيل": "description",
+    "مدين": "debit",
+    "دائن": "credit",
+    "الرصيد": "balance",
 }
 _HEADER_WORDS = set(_COL_ALIASES.keys())
+
+# Mapping used to normalise Arabic header cells to English before column detection
+_ARABIC_COL_NORM: dict = {
+    "التاريخ": "date",
+    "التفاصيل": "details",
+    "مدين": "debit",
+    "دائن": "credit",
+    "الرصيد": "balance",
+}
 
 
 def _find_col_positions(lines: list) -> dict:
@@ -234,11 +289,14 @@ def _find_col_positions(lines: list) -> dict:
                each word individually; if both are found and credit_x > debit_x
                (right-to-left makes no sense for columns) return combined positions.
     """
+    _DEBIT_WORDS  = {"debit", "withdrawal", "مدين"}
+    _CREDIT_WORDS = {"credit", "deposit", "دائن"}
+
     # Fast path — single line with both keywords
     for line in lines:
         texts = [w["text"].lower() for w in line]
-        has_debit = any(t in ("debit", "withdrawal") for t in texts)
-        has_credit = any(t in ("credit", "deposit") for t in texts)
+        has_debit  = any(t in _DEBIT_WORDS  for t in texts)
+        has_credit = any(t in _CREDIT_WORDS for t in texts)
         if has_debit and has_credit:
             cols: dict = {}
             for w in line:
@@ -252,9 +310,9 @@ def _find_col_positions(lines: list) -> dict:
     for line in lines:
         for w in line:
             wl = w["text"].lower()
-            if wl in ("debit", "withdrawal") and debit_w is None:
+            if wl in _DEBIT_WORDS and debit_w is None:
                 debit_w = w
-            elif wl in ("credit", "deposit") and credit_w is None:
+            elif wl in _CREDIT_WORDS and credit_w is None:
                 credit_w = w
 
     if debit_w and credit_w and credit_w["x0"] > debit_w["x0"]:
@@ -299,6 +357,9 @@ _PAGE_FOOTER_PHRASES = {
     "for more information on your fab",
     "see reverse side",
     "important information",
+    "statement summary",   # ENBD: summary table at page bottom
+    "upoints summary",     # ENBD: loyalty-points section
+    "emirates nbd bank",   # ENBD: bilingual legal footer
 }
 
 
@@ -365,8 +426,9 @@ def _extract_text_based(
 
             # Amount columns start at the debit column (fall back to 65% of page)
             amount_x_min = col_pos.get("debit", page_width * 0.65)
-            # Transaction dates live within the leftmost 15% of the page
-            date_x_max = page_width * 0.15
+            # Transaction dates live within the leftmost 20% of the page
+            # (generous to handle wider left-margin layouts like ENBD savings)
+            date_x_max = page_width * 0.20
 
             page_text = " ".join(w["text"] for line in lines for w in line)
             metadata.update(_extract_metadata_from_text(page_text))
@@ -485,26 +547,37 @@ def _parse_text_row(
     else:
         # No column info: position-based heuristic.
         # CC statements: all purchases are debits (they increase the balance owed).
+        # "CR" suffix on an amount marks a credit/refund (ENBD CC convention).
         # Bank accounts: single-amount lines are assumed credits (default historical behaviour).
         debit = credit = balance = None
-        vals = []
+        vals: list[float] = []
+        cr_flags: list[bool] = []
         for w in amount_words:
+            text = w["text"].strip()
+            is_cr = bool(_CR_AMOUNT_RE.search(text))
+            # Strip "CR" suffix before float conversion so it doesn't raise ValueError
+            clean = _CR_AMOUNT_RE.sub(r"\1", text) if is_cr else text
             try:
-                vals.append(float(w["text"].replace(",", "")))
+                vals.append(float(clean.replace(",", "")))
+                cr_flags.append(is_cr)
             except ValueError:
                 pass
         cc = statement_type == "credit_card"
         if len(vals) == 1:
             if cc:
-                debit = vals[0]
+                if cr_flags[0]:
+                    credit = vals[0]   # e.g. "124.75CR" = refund / payment received
+                else:
+                    debit = vals[0]    # regular purchase
             else:
                 credit = vals[0]
         elif len(vals) >= 2:
             if cc:
-                # Rightmost amount = AED Debit column; any preceding amounts are
-                # original-currency figures from the "Original CCY Amount" column.
-                # Don't guess balance without confirmed column positions for CC.
-                debit = vals[-1]
+                # Rightmost amount = AED figure; preceding amounts are original-currency.
+                if cr_flags[-1]:
+                    credit = vals[-1]
+                else:
+                    debit = vals[-1]
             else:
                 balance = vals[-1]
                 credit = vals[-2]
@@ -528,6 +601,218 @@ def _parse_text_row(
         "currency": "AED",
         "balance_after": balance,
     }
+
+
+# ─── Strategy 3: OCR extraction ───────────────────────────────────────────────
+
+_OCR_COL_NAMES = ["date", "description", "debit", "credit", "balance"]
+
+
+def _detect_ocr_col_positions(pdf_path: str, password: str = "") -> list:
+    """
+    Detect column x-boundaries from thin vertical rules in the PDF.
+    Falls back to known ENBD savings account column x-positions (PDF pts) on failure.
+    """
+    _ENBD_DEFAULTS = [17.0, 82.0, 319.0, 405.0, 494.0, 595.0]
+    try:
+        with pdfplumber.open(pdf_path, password=password) as pdf:
+            for page in pdf.pages[:4]:
+                rects = page.rects or []
+                ph = page.height
+                xs = set()
+                for r in rects:
+                    width = r["x1"] - r["x0"]
+                    height = r["bottom"] - r["top"]
+                    if width < 3 and height > ph * 0.25:
+                        xs.add(round(r["x0"], 1))
+                if len(xs) >= 4:
+                    return sorted(xs)
+    except Exception as exc:
+        logger.debug("OCR column detection from rects failed: %s", exc)
+    return _ENBD_DEFAULTS
+
+
+def _extract_with_ocr(
+    pdf_path: str,
+    account_name: str,
+    password: str = "",
+    statement_type: str = "bank_account",
+) -> tuple:
+    """
+    Strategy 3: Render pages with PyMuPDF at 300 DPI and OCR each column via
+    pytesseract.  Used as last-resort fallback when transaction text is encoded
+    as Bezier vector paths (e.g. ENBD savings account statements).
+    """
+    try:
+        import fitz  # PyMuPDF
+        import pytesseract
+        from PIL import Image
+    except ImportError as exc:
+        logger.warning("OCR strategy unavailable — missing dependency: %s", exc)
+        return [], {}
+
+    col_xs = _detect_ocr_col_positions(pdf_path, password)
+    if len(col_xs) < 3:
+        return [], {}
+
+    num_cols = min(len(_OCR_COL_NAMES), len(col_xs) - 1)
+    col_defs = [(_OCR_COL_NAMES[i], col_xs[i], col_xs[i + 1]) for i in range(num_cols)]
+
+    date_col  = next((c for c in col_defs if c[0] == "date"),        None)
+    desc_col  = next((c for c in col_defs if c[0] == "description"), None)
+    debit_col = next((c for c in col_defs if c[0] == "debit"),       None)
+    cred_col  = next((c for c in col_defs if c[0] == "credit"),      None)
+
+    if date_col is None:
+        return [], {}
+
+    DPI = 300
+    SCALE = DPI / 72.0
+
+    transactions: list = []
+    metadata: dict = {}
+
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception as exc:
+        logger.warning("OCR: PyMuPDF failed to open PDF: %s", exc)
+        return [], {}
+
+    try:
+        if password:
+            rc = doc.authenticate(password)
+            if rc == 0:
+                logger.warning("OCR: PDF authentication failed")
+                return [], {}
+
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            ph_pts = page.rect.height
+
+            # Scan 10-90% of page height; date-pattern filtering handles header/footer
+            y_top_px    = int(ph_pts * 0.10 * SCALE)
+            y_bottom_px = int(ph_pts * 0.90 * SCALE)
+
+            mat = fitz.Matrix(SCALE, SCALE)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+            # Step 1 — OCR date column to discover per-transaction y-positions
+            dx0 = int(date_col[1] * SCALE)
+            dx1 = int(date_col[2] * SCALE)
+            date_crop = img.crop((dx0, y_top_px, dx1, y_bottom_px))
+
+            try:
+                date_data = pytesseract.image_to_data(
+                    date_crop,
+                    config="--psm 4 -c tessedit_char_whitelist=0123456789/",
+                    output_type=pytesseract.Output.DICT,
+                )
+            except Exception as exc:
+                logger.warning("OCR page %d date column failed: %s", page_num + 1, exc)
+                continue
+
+            txn_rows: list = []
+            for i, word in enumerate(date_data["text"]):
+                word = (word or "").strip()
+                if not word or int(date_data["conf"][i]) < 20:
+                    continue
+                m = COMBINED_DATE_RE.search(word)
+                if not m:
+                    continue
+                date_val = _parse_date(m.group())
+                if not date_val:
+                    continue
+                # top is relative to date_crop; convert back to full-image coords
+                top_px = int(date_data["top"][i]) + y_top_px
+                ht_px  = max(int(date_data["height"][i]), 15)
+                txn_rows.append({
+                    "date":    date_val,
+                    "y_top":   top_px - 3,
+                    "y_bottom": top_px + ht_px + 3,
+                })
+
+            if not txn_rows:
+                continue
+
+            # Expand each row's y_bottom to the next row's y_top
+            for i in range(len(txn_rows) - 1):
+                txn_rows[i]["y_bottom"] = txn_rows[i + 1]["y_top"] - 1
+            txn_rows[-1]["y_bottom"] = y_bottom_px
+
+            # Step 2 — OCR description and amount columns in each transaction's y-band
+            page_count = 0
+            for row_info in txn_rows:
+                yt = max(row_info["y_top"],    0)
+                yb = min(row_info["y_bottom"], img.height)
+                if yb - yt < 4:
+                    continue
+
+                description = ""
+                if desc_col:
+                    crop = img.crop((int(desc_col[1] * SCALE), yt, int(desc_col[2] * SCALE), yb))
+                    try:
+                        description = pytesseract.image_to_string(crop, config="--psm 6").strip()
+                    except Exception:
+                        pass
+
+                debit: Optional[float] = None
+                if debit_col:
+                    crop = img.crop((int(debit_col[1] * SCALE), yt, int(debit_col[2] * SCALE), yb))
+                    try:
+                        txt = pytesseract.image_to_string(
+                            crop, config="--psm 6 -c tessedit_char_whitelist=0123456789,."
+                        ).strip()
+                        m_amt = AMOUNT_PATTERN.search(txt)
+                        if m_amt:
+                            debit = _parse_amount(m_amt.group())
+                    except Exception:
+                        pass
+
+                credit: Optional[float] = None
+                if cred_col:
+                    crop = img.crop((int(cred_col[1] * SCALE), yt, int(cred_col[2] * SCALE), yb))
+                    try:
+                        txt = pytesseract.image_to_string(
+                            crop, config="--psm 6 -c tessedit_char_whitelist=0123456789,."
+                        ).strip()
+                        m_amt = AMOUNT_PATTERN.search(txt)
+                        if m_amt:
+                            credit = _parse_amount(m_amt.group())
+                    except Exception:
+                        pass
+
+                if debit is None and credit is None:
+                    continue
+
+                # Keep only the first non-empty OCR line; subsequent lines are often
+                # Arabic barcode annotations that survive _clean_description.
+                first_line = next((l.strip() for l in description.splitlines() if l.strip()), description)
+                description = _clean_description(first_line, statement_type)
+                if not description:
+                    description = f"Transaction on {row_info['date']}"
+
+                txn_type = "debit" if debit is not None else "credit"
+                amount   = debit  if debit  is not None else credit
+
+                transactions.append({
+                    "date":         row_info["date"],
+                    "description":  description,
+                    "amount":       round(amount, 2),
+                    "type":         txn_type,
+                    "account_name": account_name,
+                    "currency":     "AED",
+                    "balance_after": None,
+                })
+                page_count += 1
+
+            logger.info("OCR page %d: extracted %d transactions", page_num + 1, page_count)
+
+    finally:
+        doc.close()
+
+    logger.info("OCR strategy total: %d transactions", len(transactions))
+    return transactions, metadata
 
 
 # ─── Metadata extraction ──────────────────────────────────────────────────────
@@ -603,6 +888,17 @@ def extract_with_pdfplumber(pdf_path: str, account_name: str, password: str = ""
             transactions = table_txns
             metadata = table_meta
             method = "pdfplumber"
+
+        # Strategy 3: OCR fallback for PDFs whose transaction text is vector paths
+        if not transactions:
+            logger.info("Strategies 1 & 2 yielded 0 — trying OCR fallback")
+            ocr_txns, ocr_meta = _extract_with_ocr(
+                pdf_path, account_name, password, statement_type
+            )
+            if ocr_txns:
+                transactions = ocr_txns
+                metadata = {**table_meta, **text_meta, **ocr_meta}
+                method = "ocr"
 
         if not transactions:
             confidence = 0.0

@@ -13,6 +13,7 @@ revenue account shadows and keeps the transfer out of income/expense reports.
 """
 import os
 import json
+import hashlib
 import logging
 import requests
 
@@ -231,6 +232,11 @@ def _build_payload(
 
     if txn.get("category"):
         entry["category_name"] = txn["category"]
+
+    # Deterministic dedup key: same transaction always gets the same external_id
+    # so Firefly rejects duplicates on re-import with HTTP 422.
+    _dedup_key = f"{date}|{description.strip().lower()}|{amount}|{account_name.strip().lower()}"
+    entry["external_id"] = hashlib.sha256(_dedup_key.encode()).hexdigest()[:20]
 
     return {
         "apply_rules": True,
@@ -552,6 +558,45 @@ def _load_transfer_rules_from_disk() -> dict:
     return merged
 
 
+def _fetch_existing_external_ids(from_date: str, to_date: str) -> set[str]:
+    """
+    Return the set of external_ids already stored in Firefly for the given date range.
+    Used for client-side dedup because Firefly III does not enforce external_id uniqueness
+    at the API level (tested on v6.6.3 — duplicate POSTs return 200 and create duplicates).
+    """
+    known: set[str] = set()
+    page = 1
+    while True:
+        try:
+            resp = requests.get(
+                f"{FIREFLY_URL}/api/v1/transactions",
+                headers=_headers(),
+                params={"start": from_date, "end": to_date, "limit": 100, "page": page},
+                timeout=30,
+            )
+        except Exception as exc:
+            logger.warning("Could not pre-fetch external_ids (page %d): %s", page, exc)
+            break
+        if not resp.ok:
+            logger.warning("Pre-fetch external_ids returned %d", resp.status_code)
+            break
+        data = resp.json()
+        for item in data.get("data", []):
+            for split in item.get("attributes", {}).get("transactions", []):
+                ext_id = split.get("external_id", "")
+                if ext_id:
+                    known.add(ext_id)
+        pag = data.get("meta", {}).get("pagination", {})
+        if page >= pag.get("total_pages", 1):
+            break
+        page += 1
+    logger.info(
+        "Pre-fetch: found %d existing external_ids in %s – %s",
+        len(known), from_date, to_date,
+    )
+    return known
+
+
 def push_to_firefly(transactions: list[dict]) -> dict:
     # Fetch asset accounts once so transfer detection works for the whole batch
     asset_accounts = _get_asset_accounts()
@@ -561,8 +606,17 @@ def push_to_firefly(transactions: list[dict]) -> dict:
         len(asset_accounts), len(transfer_rules),
     )
 
+    # Client-side dedup: Firefly III v6 does not reject duplicate external_ids.
+    # Pre-fetch all external_ids in the import date range so we can skip them ourselves.
+    dates = [t.get("date", "")[:10] for t in transactions if t.get("date", "")[:10]]
+    if dates:
+        existing_ext_ids = _fetch_existing_external_ids(min(dates), max(dates))
+    else:
+        existing_ext_ids = set()
+
     imported = 0
     skipped = 0
+    duplicates = 0
     errors = []
 
     for txn in transactions:
@@ -575,14 +629,35 @@ def push_to_firefly(transactions: list[dict]) -> dict:
                 )
                 skipped += 1
                 continue
+
+            ext_id = payload["transactions"][0].get("external_id", "")
+            if ext_id and ext_id in existing_ext_ids:
+                logger.info(
+                    "Client-side dedup — skipping existing: %s",
+                    txn.get("description", "")[:60],
+                )
+                duplicates += 1
+                continue
+
             resp = requests.post(
                 f"{FIREFLY_URL}/api/v1/transactions",
                 headers=_headers(),
                 json=payload,
                 timeout=30,
             )
+            # Fallback: 422 with external_id in body (future Firefly versions may enforce it)
+            if resp.status_code == 422 and "external_id" in resp.text:
+                logger.info(
+                    "Server-side dedup (422) — skipping: %s",
+                    txn.get("description", "")[:60],
+                )
+                duplicates += 1
+                continue
             resp.raise_for_status()
             imported += 1
+            # Track newly imported id so intra-batch duplicates are also caught
+            if ext_id:
+                existing_ext_ids.add(ext_id)
         except requests.RequestException as exc:
             msg = str(exc)
             if hasattr(exc, "response") and exc.response is not None:
@@ -595,6 +670,7 @@ def push_to_firefly(transactions: list[dict]) -> dict:
         "success": len(errors) == 0,
         "imported_count": imported,
         "skipped_count": skipped,
+        "duplicate_count": duplicates,
         "error_count": len(errors),
         "errors": errors[:5],
     }

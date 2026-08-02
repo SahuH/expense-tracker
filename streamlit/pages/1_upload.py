@@ -3,6 +3,7 @@ import requests
 import pandas as pd
 import io
 import os
+import hashlib
 from urllib.parse import quote
 
 from auth import require_login
@@ -296,14 +297,28 @@ if uploaded_file is not None:
     is_csv = uploaded_file.name.lower().endswith(".csv")
 
     if c_parse.button("Parse", type="primary", use_container_width=True):
+        file_bytes = uploaded_file.getvalue()
+        file_hash = hashlib.sha256(file_bytes).hexdigest()
+
         with st.spinner("Extracting transactions…"):
             try:
                 if is_csv:
-                    result = _parse_csv(uploaded_file.getvalue(), selected_account)
+                    # Layer 1: check CSV hash against server history before parsing
+                    try:
+                        _hist_resp = requests.get(
+                            f"{PARSER_URL}/upload-history/{file_hash}", timeout=5
+                        )
+                        if _hist_resp.ok and _hist_resp.json().get("duplicate"):
+                            st.session_state["duplicate_file"] = _hist_resp.json()["prior_upload"]
+                        else:
+                            st.session_state.pop("duplicate_file", None)
+                    except Exception:
+                        st.session_state.pop("duplicate_file", None)
+                    result = _parse_csv(file_bytes, selected_account)
                 else:
                     resp = requests.post(
                         f"{PARSER_URL}/parse",
-                        files={"file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")},
+                        files={"file": (uploaded_file.name, file_bytes, "application/pdf")},
                         data={"account_name": selected_account, "password": pdf_password or ""},
                         timeout=180,
                     )
@@ -317,6 +332,12 @@ if uploaded_file is not None:
                         st.error("❌ Incorrect PDF password. Please check and try again.")
                         st.stop()
 
+                    # Layer 1: server already checked history and attached duplicate_file if found
+                    if result.get("duplicate_file"):
+                        st.session_state["duplicate_file"] = result["duplicate_file"]
+                    else:
+                        st.session_state.pop("duplicate_file", None)
+
                 # Fetch category rules and auto-assign to extracted transactions
                 try:
                     _cr = requests.get(f"{PARSER_URL}/category-rules", timeout=5)
@@ -327,6 +348,8 @@ if uploaded_file is not None:
                     result.get("transactions", []), cat_rules, selected_account
                 )
                 st.session_state["cat_rules"] = cat_rules
+                st.session_state["file_hash"] = file_hash
+                st.session_state["file_name"] = uploaded_file.name
                 st.session_state["parse_result"] = result
             except Exception as exc:
                 st.error(f"Parser error: {exc}")
@@ -341,6 +364,18 @@ if "parse_result" in st.session_state:
     status = result.get("status", "unknown")
 
     st.subheader("3. Verification")
+
+    # Layer 1 duplicate-file warning
+    _dup = st.session_state.get("duplicate_file")
+    if _dup:
+        st.warning(
+            f"⚠️ **Duplicate file detected.** This exact file was already imported on "
+            f"{_dup.get('imported_at', '?')[:10]} for account **{_dup.get('account', '?')}** "
+            f"({_dup.get('imported_count', '?')} transactions). "
+            "Importing again will skip all existing transactions via external ID matching, "
+            "but new transactions in this file will still be imported."
+        )
+
     v1, v2, v3, v4 = st.columns(4)
     v1.metric("Transactions found", len(transactions))
     v2.metric("Method", result.get("extraction_method", "—"))
@@ -399,17 +434,26 @@ if "parse_result" in st.session_state:
     if status == "needs_review":
         if result.get("extraction_method") != "csv":
             st.warning("Manual review required — edit any rows before importing.")
-        edited_df = st.data_editor(
-            df,
-            use_container_width=True,
-            num_rows="dynamic",
-            column_config=_col_config,
-        )
-        # Convert date back to string for the import payload
-        edited_df["date"] = edited_df["date"].apply(
-            lambda d: str(d)[:10] if pd.notna(d) else ""
-        )
-        final_transactions = edited_df.to_dict(orient="records")
+
+        if df.empty:
+            st.info(
+                "No transactions were extracted from this statement. "
+                "The PDF layout may not be supported yet — try a different account or contact support."
+            )
+            final_transactions = []
+        else:
+            edited_df = st.data_editor(
+                df,
+                use_container_width=True,
+                num_rows="dynamic",
+                column_config=_col_config,
+            )
+            # Convert date back to string for the import payload
+            if "date" in edited_df.columns:
+                edited_df["date"] = edited_df["date"].apply(
+                    lambda d: str(d)[:10] if pd.notna(d) else ""
+                )
+            final_transactions = edited_df.to_dict(orient="records")
     else:
         st.dataframe(df, use_container_width=True, column_config=_col_config, hide_index=True)
         final_transactions = transactions
@@ -431,7 +475,12 @@ if "parse_result" in st.session_state:
             try:
                 import_resp = requests.post(
                     f"{PARSER_URL}/import",
-                    json={"transactions": clean_transactions},
+                    json={
+                        "transactions": clean_transactions,
+                        "file_hash": st.session_state.get("file_hash"),
+                        "filename": st.session_state.get("file_name", ""),
+                        "account": selected_account,
+                    },
                     timeout=120,
                 )
                 import_resp.raise_for_status()
@@ -440,18 +489,26 @@ if "parse_result" in st.session_state:
                 if import_result.get("success"):
                     _imported = import_result.get("imported_count", 0)
                     _skipped = import_result.get("skipped_count", 0)
-                    _skip_note = f" ({_skipped} skipped as transfer destination)" if _skipped else ""
+                    _dupes = import_result.get("duplicate_count", 0)
+                    _notes = []
+                    if _skipped:
+                        _notes.append(f"{_skipped} skipped as transfer destination")
+                    if _dupes:
+                        _notes.append(f"{_dupes} skipped as duplicates")
+                    _skip_note = f" ({', '.join(_notes)})" if _notes else ""
                     st.success(f"✅ Imported {_imported} transactions{_skip_note}!")
                     history = st.session_state.get("import_history", [])
                     history.insert(0, {
                         "Account": selected_account,
                         "Imported": _imported,
                         "Skipped": _skipped,
+                        "Duplicates": _dupes,
                         "Status": "✅ Success",
                         "Method": result.get("extraction_method"),
                     })
                     st.session_state["import_history"] = history[:10]
-                    del st.session_state["parse_result"]
+                    st.session_state.pop("parse_result", None)
+                    st.session_state.pop("duplicate_file", None)
                     st.rerun()
                 else:
                     errors = import_result.get("errors") or [import_result.get("error", "Unknown error")]
@@ -471,11 +528,12 @@ if history:
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Account":  st.column_config.TextColumn("Account"),
-            "Imported": st.column_config.NumberColumn("Imported", format="%d txns"),
-            "Skipped":  st.column_config.NumberColumn("Skipped", format="%d txns"),
-            "Status":   st.column_config.TextColumn("Status"),
-            "Method":   st.column_config.TextColumn("Method"),
+            "Account":    st.column_config.TextColumn("Account"),
+            "Imported":   st.column_config.NumberColumn("Imported",   format="%d txns"),
+            "Skipped":    st.column_config.NumberColumn("Skipped",    format="%d txns"),
+            "Duplicates": st.column_config.NumberColumn("Duplicates", format="%d txns"),
+            "Status":     st.column_config.TextColumn("Status"),
+            "Method":     st.column_config.TextColumn("Method"),
         },
     )
 else:
